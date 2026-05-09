@@ -1,3 +1,4 @@
+import base64
 import csv
 import html
 import io
@@ -6,6 +7,7 @@ import os
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
@@ -25,6 +27,8 @@ ENVoy_MARKERS = [
     "__envoy_product-info__PROPS",
 ]
 TRENDYOL_BASE = "https://www.trendyol.com"
+TRENDYOL_SEARCH_API_URL = "https://public.trendyol.com/discovery-web-searchgw-service/v2/api/infinite-scroll/sr"
+TRENDYOL_WATCH_CATEGORY_URL = "https://www.trendyol.com/saat-x-c34"
 NEKADARSATTI_API_URL = "https://nekadarsatti.com/api/sales-number"
 NEKADARSATTI_PUBLIC_API_KEY = "aJ9cgcACBCY1d3dWmJhWW8n2v2GhgP"
 NEKADARSATTI_QUERY_LIMIT = 30
@@ -35,6 +39,85 @@ LISTING_SORT_OPTIONS = {
     "En çok değerlendirilen": "MOST_RATED",
     "En çok favorilenen": "MOST_FAVOURITE",
 }
+SAAT_VE_SAAT_BRANDS = [
+    "Adidas Originals",
+    "Armani Exchange",
+    "Boss",
+    "Calvin Klein",
+    "Cerruti 1881",
+    "Diesel",
+    "DKNY",
+    "Ebel",
+    "Emporio Armani",
+    "Escape",
+    "Esprit",
+    "Ferragamo",
+    "Fitwatch",
+    "Fossil",
+    "Furla",
+    "Garmin",
+    "Gc",
+    "Guess",
+    "Huawei",
+    "Hugo",
+    "Jacques Philippe",
+    "Kenneth Cole",
+    "Lacoste",
+    "Laiza",
+    "Maurice Lacroix",
+    "Mazzucato",
+    "Michael Kors",
+    "Missoni",
+    "Oris",
+    "Parigi",
+    "Philipp Plein",
+    "Police",
+    "Puma",
+    "Raymond Weil",
+    "Roche Montre",
+    "Seiko",
+    "Seiko 5",
+    "Skagen",
+    "Skechers",
+    "Swarovski",
+    "TCL",
+    "Ted Baker",
+    "Timex",
+    "Tommy Hilfiger",
+    "Tory Burch",
+    "U.S. Polo Assn.",
+    "Universe Constant",
+    "Versace",
+    "Welder",
+    "Wesse",
+    "Xonix",
+]
+BRAND_STOCK_BRANDS = {
+    **{brand: TRENDYOL_WATCH_CATEGORY_URL for brand in SAAT_VE_SAAT_BRANDS},
+    "Apple": "https://www.trendyol.com/apple-x-b101470",
+    "Samsung": "https://www.trendyol.com/samsung-x-b794",
+    "Xiaomi": "https://www.trendyol.com/xiaomi-x-b101939",
+    "Dyson": "https://www.trendyol.com/dyson-x-b102989",
+    "Philips": "https://www.trendyol.com/philips-x-b577",
+    "Tefal": "https://www.trendyol.com/tefal-x-b326",
+    "Braun": "https://www.trendyol.com/braun-x-b633",
+    "Nike": "https://www.trendyol.com/nike-x-b44",
+    "Adidas": "https://www.trendyol.com/adidas-x-b33",
+    "Puma": "https://www.trendyol.com/puma-x-b160",
+    "New Balance": "https://www.trendyol.com/new-balance-x-b128",
+    "LEGO": "https://www.trendyol.com/lego-x-b104725",
+    "KIKO": "https://www.trendyol.com/kiko-x-b108309",
+    "Maybelline New York": "https://www.trendyol.com/maybelline-new-york-x-b476",
+    "L'Oreal Paris": "https://www.trendyol.com/l-oreal-paris-x-b568",
+    "Mango": "https://www.trendyol.com/mango-x-b41",
+    "Zara": "https://www.trendyol.com/zara-x-b40",
+    "Madame Coco": "https://www.trendyol.com/madame-coco-x-b52",
+    "English Home": "https://www.trendyol.com/english-home-x-b108306",
+    "Korkmaz": "https://www.trendyol.com/korkmaz-x-b351",
+    "Karaca": "https://www.trendyol.com/karaca-x-b325",
+}
+BRAND_STOCK_PRODUCTS_PER_PAGE = 24
+LOGO_PATH = Path(__file__).parent / "assets" / "kozade.png"
 
 
 TRENDYOL_CATEGORIES = {
@@ -138,6 +221,259 @@ if not require_password():
     st.stop()
 
 
+def image_data_uri(path):
+    if not path.exists():
+        return None
+
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def apply_kozade_theme():
+    logo_uri = image_data_uri(LOGO_PATH)
+    logo_markup = f'<img class="kozade-logo" src="{logo_uri}" alt="kozade">' if logo_uri else ""
+    palette = {
+        "cream": "#e5dfd2",
+        "cream_2": "#d9d1c2",
+        "ink": "#050505",
+        "muted": "#70695d",
+        "line": "#cfc5b5",
+        "card": "#f5f0e6",
+        "button_bg": "#050505",
+        "button_text": "#e5dfd2",
+        "button_hover": "#26231f",
+        "status_bg": "rgba(245, 240, 230, 0.74)",
+    }
+    st.markdown(
+        f"""
+        <style>
+        :root {{
+            --kozade-cream: {palette["cream"]};
+            --kozade-cream-2: {palette["cream_2"]};
+            --kozade-ink: {palette["ink"]};
+            --kozade-muted: {palette["muted"]};
+            --kozade-line: {palette["line"]};
+            --kozade-card: {palette["card"]};
+            --kozade-button-bg: {palette["button_bg"]};
+            --kozade-button-text: {palette["button_text"]};
+            --kozade-button-hover: {palette["button_hover"]};
+            --kozade-status-bg: {palette["status_bg"]};
+        }}
+
+        .stApp {{
+            background: var(--kozade-cream);
+            color: var(--kozade-ink);
+        }}
+
+        .block-container {{
+            padding-top: 5.25rem;
+            padding-left: 2rem;
+            padding-right: 2rem;
+            max-width: 1480px;
+        }}
+
+        .kozade-logo {{
+            position: absolute;
+            top: 1.15rem;
+            right: 2rem;
+            width: 142px;
+            height: auto;
+            z-index: 999999;
+            mix-blend-mode: multiply;
+        }}
+
+        h1, h2, h3, h4, h5, h6,
+        p, label, span, div {{
+            color: var(--kozade-ink);
+        }}
+
+        h1 {{
+            letter-spacing: 0;
+            font-weight: 800;
+        }}
+
+        .stCaption, [data-testid="stCaptionContainer"], .stMarkdown p {{
+            color: var(--kozade-muted);
+        }}
+
+        [data-testid="stTabs"] [role="tablist"] {{
+            border-bottom: 1px solid var(--kozade-line);
+            gap: 0.25rem;
+        }}
+
+        [data-testid="stTabs"] [role="tab"] {{
+            color: var(--kozade-muted);
+            background: transparent;
+            border-radius: 0;
+            padding: 0.75rem 1rem;
+        }}
+
+        [data-testid="stTabs"] [aria-selected="true"] {{
+            color: var(--kozade-ink);
+            border-bottom: 3px solid var(--kozade-ink);
+            font-weight: 800;
+        }}
+
+        .stButton > button,
+        .stDownloadButton > button {{
+            background: var(--kozade-button-bg);
+            color: var(--kozade-button-text) !important;
+            border: 1px solid var(--kozade-button-bg);
+            border-radius: 6px;
+            font-weight: 800;
+        }}
+
+        .stButton > button *,
+        .stButton > button p,
+        .stButton > button span,
+        .stButton > button div,
+        .stDownloadButton > button *,
+        .stDownloadButton > button p,
+        .stDownloadButton > button span,
+        .stDownloadButton > button div,
+        [data-testid="stNumberInput"] button *,
+        [data-testid="stNumberInput"] button svg {{
+            color: var(--kozade-button-text) !important;
+            fill: var(--kozade-button-text) !important;
+        }}
+
+        [data-testid="stNumberInput"] button {{
+            background: var(--kozade-button-bg) !important;
+            border-color: var(--kozade-button-bg) !important;
+            color: var(--kozade-button-text) !important;
+        }}
+
+        .stButton > button:hover,
+        .stDownloadButton > button:hover {{
+            background: var(--kozade-button-hover);
+            color: var(--kozade-button-text) !important;
+            border-color: var(--kozade-button-hover);
+        }}
+
+        [data-baseweb="input"] > div,
+        [data-baseweb="select"] > div,
+        [data-baseweb="textarea"] > div,
+        [data-testid="stNumberInput"] input,
+        textarea {{
+            background: var(--kozade-card);
+            color: var(--kozade-ink) !important;
+            border-color: var(--kozade-line);
+            border-radius: 6px;
+        }}
+
+        [data-baseweb="input"] input,
+        [data-baseweb="input"] span,
+        [data-baseweb="select"] span,
+        [data-baseweb="select"] input,
+        [data-baseweb="textarea"] textarea,
+        [data-testid="stNumberInput"] input {{
+            color: var(--kozade-ink) !important;
+            caret-color: var(--kozade-ink) !important;
+        }}
+
+        [data-baseweb="input"] input::placeholder,
+        [data-baseweb="textarea"] textarea::placeholder {{
+            color: var(--kozade-muted) !important;
+            opacity: 1;
+        }}
+
+        [data-baseweb="popover"] [role="listbox"],
+        [data-baseweb="popover"] ul {{
+            background: var(--kozade-ink);
+            border: 1px solid var(--kozade-line);
+        }}
+
+        [data-baseweb="popover"] [role="option"],
+        [data-baseweb="popover"] li,
+        [data-baseweb="popover"] div {{
+            color: var(--kozade-cream) !important;
+        }}
+
+        [data-baseweb="popover"] [role="option"]:hover,
+        [data-baseweb="popover"] li:hover {{
+            background: #2a2824 !important;
+            color: var(--kozade-cream) !important;
+        }}
+
+        [data-baseweb="tag"] {{
+            background: #f35f55;
+            color: var(--kozade-ink);
+        }}
+
+        [data-baseweb="tag"] span {{
+            color: var(--kozade-ink) !important;
+            font-weight: 800;
+        }}
+
+        [data-testid="stExpander"],
+        [data-testid="stStatusWidget"] {{
+            background: var(--kozade-status-bg);
+            border: 1px solid var(--kozade-line);
+            border-radius: 8px;
+        }}
+
+        [data-testid="stStatusWidget"] > div:first-child,
+        [data-testid="stStatusWidget"] > div:first-child *,
+        [data-testid="stExpander"] > details > summary,
+        [data-testid="stExpander"] > details > summary * {{
+            color: var(--kozade-button-text) !important;
+            fill: var(--kozade-button-text) !important;
+        }}
+
+        [data-testid="stStatusWidget"] > div:first-child,
+        [data-testid="stExpander"] > details > summary {{
+            background: var(--kozade-button-bg) !important;
+        }}
+
+        [data-testid="stMetric"] {{
+            background: var(--kozade-card);
+            border: 1px solid var(--kozade-line);
+            border-radius: 8px;
+            padding: 0.85rem 1rem;
+        }}
+
+        [data-testid="stMetricLabel"],
+        [data-testid="stMetricValue"] {{
+            color: var(--kozade-ink);
+        }}
+
+        [data-testid="stDataFrame"] {{
+            background: var(--kozade-card);
+            border: 1px solid var(--kozade-line);
+            border-radius: 8px;
+            overflow: hidden;
+        }}
+
+        .stAlert {{
+            background: var(--kozade-card);
+            color: var(--kozade-ink);
+            border-color: var(--kozade-line);
+        }}
+
+        @media (max-width: 760px) {{
+            .kozade-logo {{
+                position: static;
+                display: block;
+                width: 118px;
+                margin: 0 0 1.25rem auto;
+            }}
+
+            .block-container {{
+                padding-top: 2rem;
+                padding-left: 1rem;
+                padding-right: 1rem;
+            }}
+        }}
+        </style>
+        {logo_markup}
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+apply_kozade_theme()
+
+
 def request_page(url):
     request = Request(
         url,
@@ -181,6 +517,32 @@ def post_json(url, payload, headers=None):
         return exc.code, error_body
     except URLError as exc:
         raise RuntimeError(f"Nekadarsatti bağlantısı kurulamadı: {exc.reason}") from exc
+
+
+def request_json(url, params=None):
+    query = urlencode(params or {})
+    request_url = f"{url}?{query}" if query else url
+    request = Request(
+        request_url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Origin": TRENDYOL_BASE,
+            "Referer": f"{TRENDYOL_BASE}/",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=25) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            return json.loads(response.read().decode(charset, errors="replace"))
+    except HTTPError as exc:
+        raise RuntimeError(f"API açılamadı. HTTP {exc.code}: {request_url}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"API bağlantısı kurulamadı: {exc.reason}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("API JSON olmayan cevap döndürdü.") from exc
 
 
 def validate_trendyol_url(product_url):
@@ -253,9 +615,68 @@ def best_number_match(patterns, text):
 def with_category_query(category_url, page_no, sort_value="BEST_SELLER"):
     parsed = urlparse(category_url)
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    query["sst"] = sort_value
+    if sort_value:
+        query["sst"] = sort_value
     query["pi"] = str(page_no)
     return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def brand_search_url(brand_name):
+    brand = brand_name.strip()
+    query = urlencode({"q": brand, "qt": brand, "st": brand, "os": "1"})
+    return f"{TRENDYOL_BASE}/sr?{query}"
+
+
+def discover_search_products(search_text, pages, limit):
+    products = []
+    seen = set()
+
+    for page_no in range(1, pages + 1):
+        payload = request_json(
+            TRENDYOL_SEARCH_API_URL,
+            {
+                "q": search_text,
+                "pi": page_no,
+                "culture": "tr-TR",
+                "userGenderId": "1",
+                "pId": "0",
+                "scoringAlgorithmId": "2",
+                "categoryRelevancyEnabled": "false",
+                "isLegalRequirementConfirmed": "false",
+                "searchStrategyType": "DEFAULT",
+                "productStampType": "A",
+                "fixSlotProductAdsIncluded": "false",
+                "searchAbDeciderValues": "",
+            },
+        )
+        page_products = payload.get("result", {}).get("products") or []
+        if not page_products:
+            break
+
+        for item in page_products:
+            if not isinstance(item, dict):
+                continue
+            product_id = item.get("id") or item.get("productId")
+            product_url = item.get("url") or item.get("productUrl")
+            if not product_id and product_url:
+                product_id = extract_product_id(product_url)
+            if not product_id or str(product_id) in seen:
+                continue
+
+            seen.add(str(product_id))
+            products.append(
+                {
+                    "Sıra": len(products) + 1,
+                    "Ürün ID": str(product_id),
+                    "Ürün": item.get("name") or item.get("title") or "Trendyol ürünü",
+                    "Liste etiketi": None,
+                    "Link": normalize_product_url(product_url or f"/p-{product_id}"),
+                }
+            )
+            if len(products) >= limit:
+                return products
+
+    return products
 
 
 def normalize_product_url(raw_url):
@@ -306,9 +727,17 @@ def extract_listing_badge(context):
 def discover_category_products(category_url, pages, limit, sort_value="BEST_SELLER"):
     products = []
     seen = set()
+    last_error = None
 
     for page_no in range(1, pages + 1):
-        source = request_page(with_category_query(category_url, page_no, sort_value))
+        try:
+            source = request_page(with_category_query(category_url, page_no, sort_value))
+        except RuntimeError as exc:
+            last_error = exc
+            if products:
+                break
+            raise
+
         decoded = html.unescape(source).replace("\\/", "/")
         link_matches = list(re.finditer(r'(?:"url"\s*:\s*"|href=["\'])([^"\']*-p-\d+[^"\']*)', decoded))
 
@@ -332,6 +761,8 @@ def discover_category_products(category_url, pages, limit, sort_value="BEST_SELL
             if len(products) >= limit:
                 return products
 
+    if last_error and not products:
+        raise last_error
     return products
 
 
@@ -1030,6 +1461,20 @@ def find_brand_stock_products(
     return checked_rows, errors
 
 
+def unique_products(products):
+    seen = set()
+    unique_rows = []
+    for product in products:
+        product_id = str(product.get("Ürün ID") or "")
+        link = product.get("Link")
+        signature = product_id or link
+        if not signature or signature in seen:
+            continue
+        seen.add(signature)
+        unique_rows.append({**product, "Sıra": len(unique_rows) + 1})
+    return unique_rows
+
+
 def dataframe_download(df):
     return df.to_csv(index=False).encode("utf-8-sig")
 
@@ -1128,6 +1573,114 @@ def product_link_column_config():
             display_text="Trendyol",
         )
     }
+
+
+def configurable_table(df, key_prefix, default_columns=None, use_expander=True):
+    if df.empty:
+        return df
+
+    filtered_df = df.copy()
+    available_columns = list(filtered_df.columns)
+    visible_options = [column for column in available_columns if column != "Link"]
+    default_selection = [
+        column
+        for column in (default_columns or visible_options)
+        if column in visible_options
+    ] or visible_options
+
+    controls_area = st.expander("Tablo filtreleri ve kolonlar", expanded=True) if use_expander else st.container()
+    with controls_area:
+        search_col, numeric_col, sort_col = st.columns([1.2, 1, 1])
+
+        with search_col:
+            search_text = st.text_input(
+                "Tabloda ara",
+                placeholder="Ürün, satıcı, marka...",
+                key=f"{key_prefix}_search",
+            )
+
+        numeric_columns = [
+            column
+            for column in available_columns
+            if pd.to_numeric(filtered_df[column], errors="coerce").notna().any()
+        ]
+        with numeric_col:
+            selected_numeric_column = st.selectbox(
+                "Sayısal filtre",
+                options=["Yok"] + numeric_columns,
+                key=f"{key_prefix}_numeric_column",
+            )
+
+        with sort_col:
+            selected_sort_column = st.selectbox(
+                "Sırala",
+                options=["Yok"] + visible_options,
+                key=f"{key_prefix}_sort_column",
+            )
+
+        if search_text.strip():
+            search_pattern = re.escape(search_text.strip())
+            search_mask = filtered_df.astype(str).apply(
+                lambda column: column.str.contains(search_pattern, case=False, na=False),
+                axis=0,
+            ).any(axis=1)
+            filtered_df = filtered_df[search_mask]
+
+        if selected_numeric_column != "Yok":
+            numeric_series = pd.to_numeric(filtered_df[selected_numeric_column], errors="coerce")
+            if numeric_series.notna().any():
+                min_value = int(numeric_series.min())
+                max_value = int(numeric_series.max())
+                range_col_a, range_col_b = st.columns(2)
+                with range_col_a:
+                    filter_min = st.number_input(
+                        "Min",
+                        value=min_value,
+                        key=f"{key_prefix}_filter_min",
+                    )
+                with range_col_b:
+                    filter_max = st.number_input(
+                        "Max",
+                        value=max_value,
+                        key=f"{key_prefix}_filter_max",
+                    )
+                filtered_df = filtered_df[
+                    numeric_series.ge(filter_min) & numeric_series.le(filter_max)
+                ]
+
+        if selected_sort_column != "Yok" and selected_sort_column in filtered_df.columns:
+            ascending = st.checkbox(
+                "Küçükten büyüğe sırala",
+                value=True,
+                key=f"{key_prefix}_sort_ascending",
+            )
+            sort_values = pd.to_numeric(filtered_df[selected_sort_column], errors="coerce")
+            if sort_values.notna().any():
+                filtered_df = filtered_df.assign(_sort_values=sort_values).sort_values(
+                    "_sort_values",
+                    ascending=ascending,
+                    na_position="last",
+                ).drop(columns=["_sort_values"])
+            else:
+                filtered_df = filtered_df.sort_values(
+                    selected_sort_column,
+                    ascending=ascending,
+                    na_position="last",
+                )
+
+        selected_columns = st.multiselect(
+            "Kolon sırası / gösterilecek kolonlar",
+            options=visible_options,
+            default=default_selection,
+            key=f"{key_prefix}_columns",
+            help="Kolonları seçtiğin sıra ile gösterir. Sırayı değiştirmek için seçimi temizleyip istediğin sırayla yeniden seçebilirsin.",
+        )
+
+    selected_columns = selected_columns or visible_options
+    output_columns = [column for column in selected_columns if column in filtered_df.columns]
+    if "Ürün" in output_columns and "Link" in filtered_df.columns:
+        output_columns.append("Link")
+    return filtered_df[output_columns]
 
 
 st.title("Trendyol Fırsat Radarı")
@@ -1401,80 +1954,19 @@ with manual_tab:
 
 with brand_stock_tab:
     st.subheader("Marka ve stok")
-    st.caption("Seçtiğin kategori listesindeki ürünleri tarar, sadece seçtiğin markaya ait ve ürün max stoku belirlediğin eşiğin altında olanları listeler.")
+    st.caption("Seçtiğin markanın Trendyol marka sayfasını tarar ve ürün max stoku belirlediğin eşiğin altında kalanları listeler.")
 
-    brand_controls, brand_filters = st.columns([1, 1])
+    brand_name_col, max_stock_col, product_count_col = st.columns([1, 1, 1])
 
-    with brand_controls:
-        brand_category_names = list(TRENDYOL_CATEGORIES.keys()) + ["Özel kategori linki"]
-        brand_selected_category = st.selectbox(
-            "Trendyol kategorisi",
-            brand_category_names,
-            index=30,
-            key="brand_stock_category",
-        )
-        brand_custom_category_url = ""
-        if brand_selected_category == "Özel kategori linki":
-            brand_custom_category_url = st.text_input(
-                "Kategori linki",
-                placeholder="https://www.trendyol.com/saat-x-c34",
-                key="brand_stock_custom_category_url",
-            )
-        brand_category_url = brand_custom_category_url.strip() or TRENDYOL_CATEGORIES.get(brand_selected_category)
-
-        brand_listing_sort = st.selectbox(
-            "Liste türü",
-            list(LISTING_SORT_OPTIONS.keys()),
-            index=0,
-            key="brand_stock_listing_sort",
-        )
-        brand_pages = st.slider(
-            "Taranacak sayfa",
-            min_value=1,
-            max_value=20,
-            value=3,
-            key="brand_stock_pages",
-        )
-        brand_product_limit = st.slider(
-            "Kontrol edilecek ürün",
-            min_value=5,
-            max_value=300,
-            value=60,
-            step=5,
-            key="brand_stock_product_limit",
-        )
-
-    with brand_filters:
-        brand_suggestions = CATEGORY_BRANDS.get(brand_selected_category, [])
-        if st.button("Kategori markalarını getir", use_container_width=True, key="brand_stock_fetch_brands"):
-            if not brand_category_url:
-                st.warning("Önce kategori seç veya özel kategori linki gir.")
-            else:
-                with st.spinner("Markalar çekiliyor..."):
-                    discovered_brands = discover_category_brands(brand_category_url)
-                if discovered_brands:
-                    st.session_state[f"brand_stock_brands:{brand_category_url}"] = discovered_brands
-                    st.success(f"{len(discovered_brands)} marka bulundu.")
-                else:
-                    st.warning("Bu kategori sayfasından marka çıkarılamadı. Markayı ek marka alanına yazabilirsin.")
-
-        discovered_brand_key = f"brand_stock_brands:{brand_category_url}"
-        if discovered_brand_key in st.session_state:
-            brand_suggestions = sorted(
-                set(brand_suggestions).union(st.session_state[discovered_brand_key]),
-                key=str.casefold,
-            )
-
-        brand_stock_selected_brands = st.multiselect(
+    with brand_name_col:
+        brand_stock_brands = st.multiselect(
             "Marka",
-            options=brand_suggestions,
-            key="brand_stock_selected_brands",
+            options=sorted(BRAND_STOCK_BRANDS.keys(), key=str.casefold),
+            default=["Guess"] if "Guess" in BRAND_STOCK_BRANDS else None,
+            key="brand_stock_brands",
         )
-        brand_stock_custom_brand = st.text_input(
-            "Ek marka",
-            placeholder="Örn. Guess, Casio",
-            key="brand_stock_custom_brand",
-        )
+
+    with max_stock_col:
         brand_stock_max = st.number_input(
             "Maksimum ürün stoku",
             min_value=1,
@@ -1483,38 +1975,56 @@ with brand_stock_tab:
             step=10,
             key="brand_stock_max_stock",
         )
-        brand_stock_seller_filter = st.text_input(
-            "Satıcı filtresi (opsiyonel)",
-            placeholder="Örn. Saat & Saat",
-            key="brand_stock_seller_filter",
+
+    with product_count_col:
+        brand_stock_product_limit = st.number_input(
+            "Kontrol edilecek ürün",
+            min_value=1,
+            max_value=10000,
+            value=300,
+            step=100,
+            key="brand_stock_product_limit",
         )
 
     run_brand_stock = st.button("Marka stoklarını listele", type="primary", use_container_width=True)
 
     if run_brand_stock:
         try:
-            if not brand_category_url:
-                raise ValueError("Kategori linki boş olamaz.")
-            if not brand_stock_selected_brands and not brand_stock_custom_brand.strip():
-                raise ValueError("Önce marka seç veya ek marka alanına marka yaz.")
+            selected_brand_names = [brand.strip() for brand in brand_stock_brands if brand.strip()]
+            if not selected_brand_names:
+                raise ValueError("Önce en az bir marka seç.")
 
-            with st.status("Kategori ürünleri çekiliyor...", expanded=True) as status:
-                products = discover_category_products(
-                    brand_category_url,
-                    brand_pages,
-                    brand_product_limit,
-                    LISTING_SORT_OPTIONS[brand_listing_sort],
+            with st.status("Marka ürünleri çekiliyor...", expanded=True) as status:
+                brand_stock_pages = max(
+                    1,
+                    int((brand_stock_product_limit + BRAND_STOCK_PRODUCTS_PER_PAGE - 1) // BRAND_STOCK_PRODUCTS_PER_PAGE),
                 )
+                products = []
+                per_brand_limit = int(brand_stock_product_limit)
+                for brand_name in selected_brand_names:
+                    brand_url = BRAND_STOCK_BRANDS.get(brand_name)
+                    if not brand_url:
+                        continue
+                    st.write(f"{brand_name}: ürünler çekiliyor...")
+                    products.extend(
+                        discover_category_products(
+                            brand_url,
+                            brand_stock_pages,
+                            per_brand_limit,
+                            None,
+                        )
+                    )
+                products = unique_products(products)[: int(brand_stock_product_limit)]
                 if not products:
-                    raise RuntimeError("Kategori sayfasından ürün linki çıkarılamadı.")
+                    raise RuntimeError("Marka sayfasından ürün linki çıkarılamadı.")
                 st.write(f"{len(products)} ürün bulundu.")
 
                 progress = st.progress(0, text="Marka ve stoklar kontrol ediliyor")
                 checked, errors = find_brand_stock_products(
                     products,
-                    brand_stock_seller_filter.strip(),
-                    brand_stock_selected_brands,
-                    brand_stock_custom_brand,
+                    "",
+                    selected_brand_names,
+                    "",
                     brand_stock_max,
                     progress,
                 )
@@ -1526,6 +2036,8 @@ with brand_stock_tab:
                 "errors": errors,
                 "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "max_stock": brand_stock_max,
+                "brand": ", ".join(selected_brand_names),
+                "product_limit": int(brand_stock_product_limit),
             }
         except Exception as exc:
             st.error(str(exc))
@@ -1542,20 +2054,41 @@ with brand_stock_tab:
         metric_cols[1].metric("Eşleşen ürün", len(product_summary_df))
         metric_cols[2].metric("Satıcı/varyant satırı", len(checked_df))
         metric_cols[3].metric("Hata", len(errors_df))
-        st.caption(f"Son kontrol: {result['checked_at']} | Maksimum ürün stoku: {result['max_stock']}")
+        st.caption(
+            f"Son kontrol: {result['checked_at']} | Marka: {result.get('brand', '-')} | "
+            f"Maksimum ürün stoku: {result['max_stock']} | Ürün limiti: {result.get('product_limit', '-')}"
+        )
 
         if product_summary_df.empty:
             st.info("Bu marka ve maksimum stok eşiğiyle ürün bulunamadı.")
         else:
+            default_brand_stock_columns = [
+                "Ürün ID",
+                "Ürün",
+                "Marka",
+                "En yüksek stok satıcısı",
+                "En yüksek stok",
+                "Ürün max stok",
+                "Satıcı stokları",
+                "Favori",
+                "Yorum",
+                "Değerlendirme",
+                "Çok satan sıra",
+            ]
+            filtered_summary_df = configurable_table(
+                product_summary_df,
+                "brand_stock_summary",
+                default_brand_stock_columns,
+            )
             st.dataframe(
-                display_product_links(product_summary_df),
+                display_product_links(filtered_summary_df),
                 use_container_width=True,
                 hide_index=True,
                 column_config=product_link_column_config(),
             )
             st.download_button(
                 "Marka stok listesini CSV indir",
-                data=dataframe_download(product_summary_df),
+                data=dataframe_download(filtered_summary_df),
                 file_name="trendyol_marka_stok_listesi.csv",
                 mime="text/csv",
             )
@@ -1564,8 +2097,26 @@ with brand_stock_tab:
             if checked_df.empty:
                 st.info("Detay satırı yok.")
             else:
+                filtered_checked_df = configurable_table(
+                    checked_df,
+                    "brand_stock_details",
+                    [
+                        "Ürün ID",
+                        "Ürün",
+                        "Marka",
+                        "Satıcı",
+                        "Varyant",
+                        "Stok",
+                        "Ürün max stok",
+                        "Fiyat",
+                        "Favori",
+                        "Yorum",
+                        "Değerlendirme",
+                    ],
+                    use_expander=False,
+                )
                 st.dataframe(
-                    display_product_links(checked_df),
+                    display_product_links(filtered_checked_df),
                     use_container_width=True,
                     hide_index=True,
                     column_config=product_link_column_config(),
