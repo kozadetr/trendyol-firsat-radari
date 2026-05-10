@@ -948,6 +948,79 @@ def discover_search_products(search_text, pages, limit):
     return products
 
 
+def parse_search_products_payload(payload, base_index=0):
+    page_products = payload.get("result", {}).get("products") or []
+    products = []
+    for item in page_products:
+        if not isinstance(item, dict):
+            continue
+        product_id = item.get("id") or item.get("productId")
+        product_url = item.get("url") or item.get("productUrl")
+        if not product_id and product_url:
+            product_id = extract_product_id(product_url)
+        if not product_id:
+            continue
+
+        products.append(
+            {
+                "Sıra": base_index + len(products) + 1,
+                "Ürün ID": str(product_id),
+                "Ürün": item.get("name") or item.get("title") or "Trendyol ürünü",
+                "Liste etiketi": None,
+                "Link": normalize_product_url(product_url or f"/p-{product_id}"),
+            }
+        )
+    return products
+
+
+def request_search_products_page(search_text, page_no):
+    payload = request_json(
+        TRENDYOL_SEARCH_API_URL,
+        {
+            "q": search_text,
+            "pi": page_no,
+            "culture": "tr-TR",
+            "userGenderId": "1",
+            "pId": "0",
+            "scoringAlgorithmId": "2",
+            "categoryRelevancyEnabled": "false",
+            "isLegalRequirementConfirmed": "false",
+            "searchStrategyType": "DEFAULT",
+            "productStampType": "A",
+            "fixSlotProductAdsIncluded": "false",
+            "searchAbDeciderValues": "",
+        },
+    )
+    return parse_search_products_payload(payload)
+
+
+def discover_search_products_fast(search_text, pages, limit, workers=8):
+    products = []
+    seen = set()
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
+        futures = {
+            executor.submit(request_search_products_page, search_text, page_no): page_no
+            for page_no in range(1, pages + 1)
+        }
+        for future in as_completed(futures):
+            page_no = futures[future]
+            try:
+                page_products = future.result()
+            except Exception:
+                continue
+            for item in page_products:
+                product_id = str(item.get("Ürün ID") or "")
+                if not product_id or product_id in seen:
+                    continue
+                seen.add(product_id)
+                products.append({**item, "_page": page_no})
+    products = sorted(products, key=lambda item: (item.get("_page", 0), item.get("Sıra", 0)))
+    return [
+        {key: value for key, value in {**product, "Sıra": index}.items() if key != "_page"}
+        for index, product in enumerate(products[:limit], start=1)
+    ]
+
+
 def normalize_product_url(raw_url):
     raw_url = html.unescape(raw_url).replace("\\/", "/").strip()
     raw_url = raw_url.split("?")[0]
@@ -1033,6 +1106,62 @@ def discover_category_products(category_url, pages, limit, sort_value="BEST_SELL
     if last_error and not products:
         raise last_error
     return products
+
+
+def parse_category_products_source(source):
+    decoded = html.unescape(source).replace("\\/", "/")
+    products = []
+    link_matches = list(re.finditer(r'(?:"url"\s*:\s*"|href=["\'])([^"\']*-p-\d+[^"\']*)', decoded))
+
+    for match in link_matches:
+        product_url = normalize_product_url(match.group(1))
+        product_id = extract_product_id(product_url)
+        if not product_id:
+            continue
+
+        context = decoded[max(0, match.start() - 900) : min(len(decoded), match.end() + 900)]
+        products.append(
+            {
+                "Sıra": len(products) + 1,
+                "Ürün ID": product_id,
+                "Ürün": extract_title_from_context(context),
+                "Liste etiketi": extract_listing_badge(context),
+                "Link": product_url,
+            }
+        )
+    return products
+
+
+def request_category_products_page(category_url, page_no, sort_value):
+    source = request_page(with_category_query(category_url, page_no, sort_value))
+    return parse_category_products_source(source)
+
+
+def discover_category_products_fast(category_url, pages, limit, sort_value="BEST_SELLER", workers=8):
+    products = []
+    seen = set()
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
+        futures = {
+            executor.submit(request_category_products_page, category_url, page_no, sort_value): page_no
+            for page_no in range(1, pages + 1)
+        }
+        for future in as_completed(futures):
+            page_no = futures[future]
+            try:
+                page_products = future.result()
+            except Exception:
+                continue
+            for item in page_products:
+                product_id = str(item.get("Ürün ID") or "")
+                if not product_id or product_id in seen:
+                    continue
+                seen.add(product_id)
+                products.append({**item, "_page": page_no})
+    products = sorted(products, key=lambda item: (item.get("_page", 0), item.get("Sıra", 0)))
+    return [
+        {key: value for key, value in {**product, "Sıra": index}.items() if key != "_page"}
+        for index, product in enumerate(products[:limit], start=1)
+    ]
 
 
 def discover_category_brands(category_url):
@@ -2196,11 +2325,15 @@ def configurable_table(df, key_prefix, default_columns=None, use_expander=True):
 st.title("Trendyol Fırsat Radarı")
 st.caption("Kategori seç, çok satan ürünleri tara, 3 günlük satış adedi ile satıcı stoklarını karşılaştır.")
 
-radar_tab, manual_tab, brand_stock_tab, profit_tab, single_tab = st.tabs(
-    ["Fırsat radarı", "Manuel ürün özeti", "Marka ve stok", "Kâr hesabı", "Tek ürün stok okuyucu"]
+selected_main_tab = st.radio(
+    "Bölüm",
+    ["Fırsat radarı", "Manuel ürün özeti", "Marka ve stok", "Kâr hesabı", "Tek ürün stok okuyucu"],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="main_section",
 )
 
-with radar_tab:
+if selected_main_tab == "Fırsat radarı":
     controls, sales_panel = st.columns([1, 1])
 
     with controls:
@@ -2498,7 +2631,7 @@ with radar_tab:
             else:
                 st.dataframe(errors_df, use_container_width=True, hide_index=True)
 
-with manual_tab:
+if selected_main_tab == "Manuel ürün özeti":
     st.subheader("Ürün bazlı manuel kontrol")
     st.caption("Fırsat taramasından gelen sonuçları ürün başına tek satıra indirir. Aynı ürünün satıcı stokları ayrı ayrı satır oluşturmaz.")
 
@@ -2531,7 +2664,7 @@ with manual_tab:
                 mime="text/csv",
             )
 
-with brand_stock_tab:
+if selected_main_tab == "Marka ve stok":
     st.subheader("Marka ve stok")
     st.caption("Seçtiğin markanın Trendyol marka sayfasını veya arama sonuçlarını tarar ve ürün max stoku belirlediğin eşiğin altında kalanları listeler.")
 
@@ -2600,19 +2733,28 @@ with brand_stock_tab:
 
     if reset_brand_stock:
         st.session_state.pop("brand_stock_result", None)
+        st.session_state["brand_stock_autorun"] = False
         st.rerun()
 
     if stop_brand_stock and active_result:
         active_result["running"] = False
         st.session_state["brand_stock_result"] = active_result
+        st.session_state["brand_stock_autorun"] = False
         st.rerun()
 
     if run_brand_stock and active_result and not active_result.get("complete"):
         active_result["running"] = True
         st.session_state["brand_stock_result"] = active_result
+        st.session_state["brand_stock_autorun"] = True
         st.rerun()
 
-    if run_brand_stock or scan_running:
+    should_run_brand_scan = run_brand_stock or (
+        scan_running
+        and st.session_state.get("main_section") == "Marka ve stok"
+        and st.session_state.get("brand_stock_autorun")
+    )
+
+    if should_run_brand_scan:
         try:
             selected_brand_names = [brand.strip() for brand in brand_stock_brands if brand.strip()]
             if not selected_brand_names:
@@ -2642,19 +2784,21 @@ with brand_stock_tab:
                         st.write(f"{brand_name}: ürünler çekiliyor...")
                         if brand_url:
                             products.extend(
-                                discover_category_products(
+                                discover_category_products_fast(
                                     brand_url,
                                     brand_stock_pages,
                                     per_brand_limit,
                                     None,
+                                    workers=int(brand_parallel_workers),
                                 )
                             )
                         else:
                             products.extend(
-                                discover_search_products(
+                                discover_search_products_fast(
                                     brand_name,
                                     brand_stock_pages,
                                     per_brand_limit,
+                                    workers=int(brand_parallel_workers),
                                 )
                             )
                     products = unique_products(products)[: int(brand_stock_product_limit)]
@@ -2675,8 +2819,10 @@ with brand_stock_tab:
                     "complete": False,
                     "running": True,
                 }
+                st.session_state["brand_stock_autorun"] = True
             else:
                 result["running"] = True
+                st.session_state["brand_stock_autorun"] = True
 
             products = result["products"]
             start_index = int(result.get("next_index", 0))
@@ -2684,6 +2830,7 @@ with brand_stock_tab:
                 result["complete"] = True
                 result["running"] = False
                 st.session_state["brand_stock_result"] = result
+                st.session_state["brand_stock_autorun"] = False
                 st.success("Bu tarama zaten tamamlanmış.")
             else:
                 progress = st.progress(0, text="Marka ve stoklar kontrol ediliyor")
@@ -2710,9 +2857,11 @@ with brand_stock_tab:
                 result["running"] = not result["complete"]
                 st.session_state["brand_stock_result"] = result
                 if result["complete"]:
+                    st.session_state["brand_stock_autorun"] = False
                     st.success("Marka stok taraması tamamlandı.")
                 else:
                     st.info(f"{next_index}/{len(products)} ürün kontrol edildi. Otomatik devam ediyor...")
+                    st.session_state["brand_stock_autorun"] = True
                     time.sleep(0.5)
                     st.rerun()
         except Exception as exc:
@@ -2823,7 +2972,7 @@ with brand_stock_tab:
                     column_config=product_link_column_config(),
                 )
 
-with profit_tab:
+if selected_main_tab == "Kâr hesabı":
     st.subheader("Kâr hesabı")
     st.caption("Satış, alış, komisyon, KDV, kargo ve ek giderleri girerek Trendyol net kârını hesaplar.")
 
@@ -2973,7 +3122,7 @@ with profit_tab:
         "Trendyol Satıcı Paneli'nden kontrol edip manuel komisyon alanına yaz."
     )
 
-with single_tab:
+if selected_main_tab == "Tek ürün stok okuyucu":
     left_col, right_col = st.columns([1.2, 0.8])
 
     with left_col:
