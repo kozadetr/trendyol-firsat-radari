@@ -375,7 +375,9 @@ BRAND_STOCK_BRANDS = {
     "ACAR": "https://www.trendyol.com/acar-x-b110584",
 }
 BRAND_STOCK_PRODUCTS_PER_PAGE = 24
-BRAND_STOCK_WORKERS = 8
+BRAND_STOCK_WORKERS = 12
+BRAND_STOCK_LIVE_RENDER_EVERY = 12
+BRAND_STOCK_PROGRESS_EVERY = 10
 LOGO_PATH = Path(__file__).parent / "assets" / "kozade.png"
 
 BRAND_NKS_FALLBACK_CATEGORIES = {
@@ -2423,6 +2425,21 @@ def find_brand_stock_products_parallel(
     batch_products = products[start_index:end_index]
     completed = start_index
     preview_rows = list(existing_checked or [])[-80:]
+    last_rendered_checked = 0
+
+    def render_preview():
+        preview_df = product_summary_rows(
+            pd.DataFrame(preview_rows[-80:]),
+            include_signal_columns=False,
+            sort_rows=False,
+        )
+        if not preview_df.empty:
+            live_container.dataframe(
+                display_product_links(preview_df),
+                use_container_width=True,
+                hide_index=True,
+                column_config=product_link_column_config(),
+            )
 
     with ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
         futures = {
@@ -2444,19 +2461,22 @@ def find_brand_stock_products_parallel(
             stats = merge_stats(stats, product_stats)
             if product_checked:
                 preview_rows.extend(product_checked)
-                preview_df = product_summary_rows(
-                    pd.DataFrame(preview_rows),
-                    include_signal_columns=False,
-                    sort_rows=False,
+                if len(checked_rows) - last_rendered_checked >= BRAND_STOCK_LIVE_RENDER_EVERY:
+                    render_preview()
+                    last_rendered_checked = len(checked_rows)
+
+            if (
+                completed == end_index
+                or completed % BRAND_STOCK_PROGRESS_EVERY == 0
+                or product_errors
+            ):
+                progress.progress(
+                    completed / max(len(products), 1),
+                    text=f"{completed}/{len(products)} marka/stok kontrol ediliyor",
                 )
-                if not preview_df.empty:
-                    live_container.dataframe(
-                        display_product_links(preview_df),
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config=product_link_column_config(),
-                    )
-            progress.progress(completed / max(len(products), 1), text=f"{completed}/{len(products)} marka/stok kontrol ediliyor")
+
+    if checked_rows and len(checked_rows) != last_rendered_checked:
+        render_preview()
 
     progress.empty()
     return checked_rows, errors, stats, end_index
@@ -2535,7 +2555,8 @@ def clear_brand_stock_state():
 
 def favorites_connection():
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(FAVORITES_DB_PATH)
+    connection = sqlite3.connect(FAVORITES_DB_PATH, timeout=30)
+    connection.execute("PRAGMA journal_mode=WAL")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS favorites (
@@ -2615,6 +2636,7 @@ def add_favorite_rows(rows):
             )
             if connection.total_changes > before:
                 inserted += 1
+        connection.commit()
     return inserted
 
 
@@ -2627,6 +2649,7 @@ def delete_favorites(product_ids):
             "DELETE FROM favorites WHERE product_id = ?",
             [(product_id,) for product_id in clean_ids],
         )
+        connection.commit()
         return connection.total_changes
 
 
@@ -3758,7 +3781,10 @@ if selected_main_tab == "Marka ve stok":
                     filtered_summary_df["Ürün ID"].astype(str).isin(selected_favorite_ids)
                 ].to_dict("records")
                 added_count = add_favorite_rows(rows_to_favorite)
-                st.success(f"{added_count} ürün favorilere eklendi.")
+                total_favorites = len(favorite_rows())
+                st.success(f"{added_count} ürün favorilere eklendi. Favorilerde toplam {total_favorites} ürün var.")
+                time.sleep(0.2)
+                st.rerun()
             st.download_button(
                 "Marka stok listesini CSV indir",
                 data=dataframe_download(filtered_summary_df),
