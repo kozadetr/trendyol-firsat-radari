@@ -513,16 +513,16 @@ def apply_kozade_theme():
     logo_uri = image_data_uri(LOGO_PATH)
     logo_markup = f'<img class="kozade-logo" src="{logo_uri}" alt="kozade">' if logo_uri else ""
     palette = {
-        "cream": "#e5dfd2",
-        "cream_2": "#d9d1c2",
+        "cream": "#f1efe7",
+        "cream_2": "#e6e0d3",
         "ink": "#050505",
         "muted": "#70695d",
-        "line": "#cfc5b5",
-        "card": "#f5f0e6",
+        "line": "#d6cebf",
+        "card": "#f7f4ee",
         "button_bg": "#050505",
-        "button_text": "#e5dfd2",
+        "button_text": "#f1efe7",
         "button_hover": "#26231f",
-        "status_bg": "rgba(245, 240, 230, 0.74)",
+        "status_bg": "rgba(241, 239, 231, 0.82)",
     }
     st.markdown(
         f"""
@@ -559,7 +559,6 @@ def apply_kozade_theme():
             width: 142px;
             height: auto;
             z-index: 999999;
-            mix-blend-mode: multiply;
         }}
 
         h1, h2, h3, h4, h5, h6,
@@ -3469,7 +3468,7 @@ if selected_main_tab == "Marka ve stok":
         key="brand_stock_category_ids",
     )
 
-    brand_batch_size = st.slider(
+    brand_batch_size = st.number_input(
         "Tek seferde kontrol edilecek ürün",
         min_value=50,
         max_value=500,
