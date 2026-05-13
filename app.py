@@ -1,5 +1,6 @@
 import base64
 import csv
+import difflib
 import hashlib
 import html
 import io
@@ -36,13 +37,15 @@ TRENDYOL_SFINT_SEARCH_API_URL = "https://apigw.trendyol.com/discovery-sfint-sear
 TRENDYOL_WATCH_CATEGORY_URL = "https://www.trendyol.com/saat-x-c34"
 NEKADARSATTI_API_URL = "https://nekadarsatti.com/api/sales-number"
 NEKADARSATTI_PRODUCT_RESEARCH_API_URL = "https://nekadarsatti.com/api/product-research"
-NEKADARSATTI_PUBLIC_API_KEY = "aJ9cgcACBCY1d3dWmJhWW8n2v2GhgP"
-NEKADARSATTI_QUERY_LIMIT = 30
+NEKADARSATTI_PUBLIC_API_KEY = os.getenv("NEKADARSATTI_API_KEY") or "aJ9cgcACBCY1d3dWmJhWW8n2v2GhgP"
+NEKADARSATTI_SESSION_COOKIE = os.getenv("NEKADARSATTI_COOKIE", "").strip()
+NEKADARSATTI_QUERY_LIMIT = int(os.getenv("NEKADARSATTI_QUERY_LIMIT", "10000" if NEKADARSATTI_SESSION_COOKIE else "30"))
 AUTH_QUERY_PARAM = "kozade_auth"
 RUNTIME_DIR = Path(__file__).parent / ".runtime"
 BRAND_STOCK_STATE_PATH = RUNTIME_DIR / "brand_stock_result.json"
 FAVORITES_DB_PATH = RUNTIME_DIR / "favorites.db"
 FAVORITES_DATABASE_URL = os.getenv("FAVORITES_DATABASE_URL") or os.getenv("DATABASE_URL")
+STOCK_TRACKING_INITIAL_BRANDS = ["Madame Coco", "English Home", "Karaca", "Karaca Home"]
 
 LISTING_SORT_OPTIONS = {
     "En çok satan": "BEST_SELLER",
@@ -358,6 +361,7 @@ BRAND_STOCK_BRANDS = {
     "Mango": "https://www.trendyol.com/mango-x-b41",
     "Zara": "https://www.trendyol.com/zara-x-b40",
     "LC Waikiki": "https://www.trendyol.com/lc-waikiki-x-b859",
+    "IKEA": "https://www.trendyol.com/ikea-x-b108268",
     "Madame Coco": "https://www.trendyol.com/madame-coco-x-b52",
     "English Home": "https://www.trendyol.com/english-home-x-b108306",
     "Korkmaz": "https://www.trendyol.com/korkmaz-x-b351",
@@ -807,6 +811,37 @@ def post_json(url, payload, headers=None):
         raise RuntimeError(f"Nekadarsatti bağlantısı kurulamadı: {exc.reason}") from exc
 
 
+def nekadarsatti_headers(referer="https://nekadarsatti.com/"):
+    headers = {
+        "x-api-key": NEKADARSATTI_PUBLIC_API_KEY,
+        "Referer": referer,
+    }
+    session_cookie = get_nekadarsatti_cookie()
+    if session_cookie:
+        headers["Cookie"] = session_cookie
+    return headers
+
+
+def get_nekadarsatti_cookie():
+    try:
+        saved_cookie = app_setting("NEKADARSATTI_COOKIE")
+    except Exception:
+        saved_cookie = None
+    return (saved_cookie or NEKADARSATTI_SESSION_COOKIE or "").strip()
+
+
+def get_nekadarsatti_query_limit():
+    try:
+        saved_limit = app_setting("NEKADARSATTI_QUERY_LIMIT")
+    except Exception:
+        saved_limit = None
+    raw_limit = saved_limit or os.getenv("NEKADARSATTI_QUERY_LIMIT") or NEKADARSATTI_QUERY_LIMIT
+    try:
+        return max(1, int(raw_limit))
+    except (TypeError, ValueError):
+        return 30
+
+
 def request_json(url, params=None):
     query = urlencode(params or {})
     request_url = f"{url}?{query}" if query else url
@@ -938,6 +973,13 @@ def parse_compact_number(value):
         return None
 
 
+def safe_int(value):
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return None
+    return int(numeric)
+
+
 def best_number_match(patterns, text):
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -1018,6 +1060,7 @@ def discover_search_products(search_text, pages, limit):
                     "Sıra": len(products) + 1,
                     "Ürün ID": str(product_id),
                     "Ürün": item.get("name") or item.get("title") or "Trendyol ürünü",
+                    "Marka": item.get("brandName") or item.get("brand"),
                     "Liste etiketi": None,
                     "Link": normalize_product_url(product_url or f"/p-{product_id}"),
                 }
@@ -1046,6 +1089,7 @@ def parse_search_products_payload(payload, base_index=0):
                 "Sıra": base_index + len(products) + 1,
                 "Ürün ID": str(product_id),
                 "Ürün": item.get("name") or item.get("title") or "Trendyol ürünü",
+                "Marka": item.get("brandName") or item.get("brand"),
                 "Liste etiketi": None,
                 "Link": normalize_product_url(product_url or f"/p-{product_id}"),
             }
@@ -1075,6 +1119,7 @@ def parse_sfint_products_payload(payload, base_index=0):
                 "Sıra": base_index + len(products) + 1,
                 "Ürün ID": str(product_id),
                 "Ürün": full_name,
+                "Marka": brand,
                 "Liste etiketi": None,
                 "Link": normalize_product_url(product_url or f"/p-{product_id}"),
             }
@@ -1228,6 +1273,8 @@ def normalize_product_url(raw_url):
         raw_url = urljoin(TRENDYOL_BASE, raw_url)
     elif not raw_url.startswith("http"):
         raw_url = urljoin(TRENDYOL_BASE, "/" + raw_url.lstrip("/"))
+    raw_url = raw_url.replace("https://www.trendyol.com/en/", "https://www.trendyol.com/")
+    raw_url = raw_url.replace("https://www.trendyol.com/de/", "https://www.trendyol.com/")
     return raw_url
 
 
@@ -1542,6 +1589,14 @@ def product_summary(props):
     }
 
 
+def best_product_name(*values):
+    for value in values:
+        text = clean_text(value)
+        if text and text != "Trendyol ürünü":
+            return text
+    return "Trendyol ürünü"
+
+
 def product_category_info(product):
     category_tree = product.get("webCategoryTree") or product.get("categoryTree") or []
     if isinstance(category_tree, list):
@@ -1620,17 +1675,41 @@ def seller_rows(props):
     listing = product.get("merchantListing", {})
     rows = []
 
+    def append_variant_row(merchant, variant, source, fallback_price):
+        if isinstance(merchant, dict) and isinstance(variant, dict):
+            rows.append(make_row(merchant, variant, source, fallback_price))
+
     winner_variant = listing.get("winnerVariant")
     main_merchant = listing.get("merchant", {})
-    if isinstance(winner_variant, dict):
-        rows.append(make_row(main_merchant, winner_variant, "Seçili satıcı", listing.get("price")))
+    append_variant_row(main_merchant, winner_variant, "Seçili satıcı", listing.get("price"))
 
     for merchant in listing.get("otherMerchants", []):
         if not isinstance(merchant, dict):
             continue
         for variant in merchant.get("variants", []):
-            if isinstance(variant, dict):
-                rows.append(make_row(merchant, variant, "Diğer satıcı", merchant.get("price")))
+            append_variant_row(merchant, variant, "Diğer satıcı", merchant.get("price"))
+
+    def walk_listing_tree(node):
+        if isinstance(node, dict):
+            merchant = node.get("merchant") if isinstance(node.get("merchant"), dict) else None
+            fallback_price = node.get("price")
+            if merchant:
+                for key in ("winnerVariant", "selectedVariant", "variant"):
+                    append_variant_row(merchant, node.get(key), "Satıcı", fallback_price)
+                for variant in node.get("variants", []):
+                    append_variant_row(merchant, variant, "Satıcı", fallback_price)
+
+            if ("name" in node or "id" in node) and isinstance(node.get("variants"), list):
+                for variant in node.get("variants", []):
+                    append_variant_row(node, variant, "Satıcı", fallback_price)
+
+            for value in node.values():
+                walk_listing_tree(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk_listing_tree(value)
+
+    walk_listing_tree(product)
 
     seen = set()
     unique_rows = []
@@ -1685,14 +1764,20 @@ def analyze_source(source_text):
     rows = seller_rows(props)
     raw_rows = raw_quantity_matches(source_text)
 
-    if not rows and raw_rows:
+    stock_like_raw_rows = [
+        row
+        for row in raw_rows
+        if any(token in str(row.get("Bağlam") or "") for token in ("variants", "inStock", "listingId"))
+    ]
+    if not rows and stock_like_raw_rows:
+        best_raw_row = max(stock_like_raw_rows, key=lambda row: row["Quantity"])
         rows = [
             {
                 "Satıcı": "Kaynak metin",
                 "Satıcı ID": None,
                 "Varyant": "Bulunan quantity",
-                "Quantity": raw_rows[0]["Quantity"],
-                "Stok durumu": stock_status(True, raw_rows[0]["Quantity"]),
+                "Quantity": best_raw_row["Quantity"],
+                "Stok durumu": stock_status(True, best_raw_row["Quantity"]),
                 "Fiyat": None,
                 "Maks. satış": None,
                 "Listing ID": None,
@@ -1831,7 +1916,7 @@ def fetch_nekadarsatti_sales(product):
     status, response_text = post_json(
         NEKADARSATTI_API_URL,
         {"productUrl": product["Link"]},
-        headers={"x-api-key": NEKADARSATTI_PUBLIC_API_KEY},
+        headers=nekadarsatti_headers(),
     )
 
     if status >= 400:
@@ -1846,7 +1931,7 @@ def fetch_nekadarsatti_sales(product):
 
 
 def fetch_nekadarsatti_sales_map(products, limit, delay_seconds, status_container):
-    limited_products = products[: min(limit, NEKADARSATTI_QUERY_LIMIT)]
+    limited_products = products[: min(int(limit), len(products))]
     sales_rows = []
     sales_errors = []
 
@@ -1908,10 +1993,7 @@ def fetch_nekadarsatti_category_products(category_key, category_name=None):
     status, response_text = post_json(
         NEKADARSATTI_PRODUCT_RESEARCH_API_URL,
         {"selectedKey": str(category_key), "onlyGenericBrands": False},
-        headers={
-            "x-api-key": NEKADARSATTI_PUBLIC_API_KEY,
-            "Referer": "https://nekadarsatti.com/trendyol-cok-satanlar",
-        },
+        headers=nekadarsatti_headers("https://nekadarsatti.com/trendyol-cok-satanlar"),
     )
 
     if status >= 400:
@@ -2073,7 +2155,7 @@ def find_opportunities(products, sales_map, seller_filter, skip_without_sales, p
 
         for row in rows:
             seller_name = str(row.get("Satıcı") or "")
-            if seller_filter and seller_filter.casefold() not in seller_name.casefold():
+            if not seller_matches(seller_name, seller_filter):
                 continue
 
             quantity = pd.to_numeric(row.get("Quantity"), errors="coerce")
@@ -2116,6 +2198,21 @@ def brand_matches(brand_name, selected_brands, custom_brand_filter):
 
     normalized_brand = str(brand_name or "").casefold()
     return any(brand in normalized_brand for brand in filters)
+
+
+def seller_matches(seller_name, seller_filter="", own_brand_name=None):
+    filters = [
+        seller.strip().casefold()
+        for seller in str(seller_filter or "").split(",")
+        if seller.strip()
+    ]
+    if own_brand_name:
+        filters.append(str(own_brand_name).strip().casefold())
+    if not filters:
+        return True
+
+    normalized_seller = str(seller_name or "").casefold()
+    return any(seller in normalized_seller for seller in filters)
 
 
 def signal_hit(signal, min_sales_3d, min_views_1d, min_basket, min_favorite, max_best_rank):
@@ -2176,7 +2273,7 @@ def find_signal_opportunities(
 
         for row in rows:
             seller_name = str(row.get("Satıcı") or "")
-            if seller_filter and seller_filter.casefold() not in seller_name.casefold():
+            if not seller_matches(seller_name, seller_filter):
                 continue
 
             quantity = pd.to_numeric(row.get("Quantity"), errors="coerce")
@@ -2278,7 +2375,7 @@ def find_brand_stock_products(
         seller_records = []
         for row in rows:
             seller_name = str(row.get("Satıcı") or "")
-            if seller_filter and seller_filter.casefold() not in seller_name.casefold():
+            if not seller_matches(seller_name, seller_filter):
                 continue
 
             quantity = pd.to_numeric(row.get("Quantity"), errors="coerce")
@@ -2328,7 +2425,14 @@ def find_brand_stock_products(
     return checked_rows, errors, stats, end_index
 
 
-def check_brand_stock_product(product, selected_brands, custom_brand_filter, seller_filter, max_stock):
+def check_brand_stock_product(
+    product,
+    selected_brands,
+    custom_brand_filter,
+    seller_filter,
+    max_stock,
+    own_brand_seller_only=False,
+):
     product_id = str(product["Ürün ID"])
     stats = {
         "Ürün kontrol": 1,
@@ -2348,9 +2452,10 @@ def check_brand_stock_product(product, selected_brands, custom_brand_filter, sel
     stats["Marka eşleşti"] += 1
 
     seller_records = []
+    own_brand_name = summary.get("Marka") if own_brand_seller_only else None
     for row in rows:
         seller_name = str(row.get("Satıcı") or "")
-        if seller_filter and seller_filter.casefold() not in seller_name.casefold():
+        if not seller_matches(seller_name, seller_filter, own_brand_name):
             continue
 
         quantity = pd.to_numeric(row.get("Quantity"), errors="coerce")
@@ -2412,6 +2517,7 @@ def find_brand_stock_products_parallel(
     start_index=0,
     batch_size=None,
     workers=8,
+    own_brand_seller_only=False,
 ):
     checked_rows = []
     errors = []
@@ -2450,6 +2556,7 @@ def find_brand_stock_products_parallel(
                 custom_brand_filter,
                 seller_filter,
                 max_stock,
+                own_brand_seller_only,
             ): product
             for product in batch_products
         }
@@ -2482,6 +2589,213 @@ def find_brand_stock_products_parallel(
     return checked_rows, errors, stats, end_index
 
 
+def read_product_trendyol_stock(product, selected_brands=None):
+    product_id = str(product.get("Ürün ID") or "")
+    if not product.get("Link"):
+        return None, {"Ürün ID": product_id, "Ürün": product.get("Ürün"), "Hata": "Trendyol linki yok", "Link": None}
+    try:
+        source = fetch_page(product["Link"])
+        summary, rows, _ = analyze_source(source)
+    except Exception as exc:
+        return None, {"Ürün ID": product_id, "Ürün": product.get("Ürün"), "Hata": str(exc), "Link": product.get("Link")}
+
+    if selected_brands and not brand_matches(summary.get("Marka"), selected_brands, ""):
+        return None, None
+
+    seller_stock_rows = []
+    for row in rows:
+        quantity = pd.to_numeric(row.get("Quantity"), errors="coerce")
+        if pd.isna(quantity):
+            continue
+        seller_stock_rows.append(
+            {
+                "seller": row.get("Satıcı"),
+                "stock": int(quantity),
+            }
+        )
+    top_stock_record = max(seller_stock_rows, key=lambda item: item["stock"]) if seller_stock_rows else None
+    top_stock = top_stock_record["stock"] if top_stock_record else None
+    total_stock = sum(item["stock"] for item in seller_stock_rows) if seller_stock_rows else None
+    return {
+        "Ürün ID": product_id,
+        "Ürün adı": best_product_name(summary.get("Ürün"), product.get("Ürün"), product.get("Ürün adı")),
+        "Marka": summary.get("Marka") or product.get("Marka"),
+        "Kategori": summary.get("Kategori") or product.get("Kategori"),
+        "Trendyol linki": product.get("Link"),
+        "Trendyol stoğu": top_stock,
+        "En yüksek stok satıcısı": top_stock_record["seller"] if top_stock_record else None,
+        "Toplam Trendyol stoğu": total_stock,
+        "3 günlük satış": None,
+    }, None
+
+
+def nks_stock_rows(products, selected_brands=None, status_container=None, delay_seconds=10, live_container=None):
+    rows = []
+    errors = []
+
+    for index, product in enumerate(products, start=1):
+        if status_container:
+            status_container.write(f"Trendyol stok {index}/{len(products)}: {product.get('Ürün ID')}")
+        row, error = read_product_trendyol_stock(product, selected_brands)
+        if error:
+            errors.append(error)
+            continue
+        if not row:
+            continue
+        if status_container:
+            status_container.write(f"Nekadarsatti {index}/{len(products)}: {row.get('Ürün ID')}")
+        try:
+            sales_row = fetch_nekadarsatti_sales(
+                {
+                    "Ürün ID": row["Ürün ID"],
+                    "Ürün": row["Ürün adı"],
+                    "Link": row["Trendyol linki"],
+                }
+            )
+            row["3 günlük satış"] = sales_row.get("3 günlük satış")
+        except Exception as exc:
+            errors.append(
+                {
+                    "Ürün ID": row["Ürün ID"],
+                    "Ürün": row["Ürün adı"],
+                    "Hata": str(exc),
+                    "Link": row["Trendyol linki"],
+                }
+            )
+        rows.append(row)
+        upsert_nks_stock_rows([row])
+        render_nks_live_rows(rows, live_container)
+        if index < len(products) and delay_seconds > 0:
+            time.sleep(delay_seconds)
+
+    return rows, errors
+
+
+def render_nks_live_rows(rows, live_container):
+    if not live_container or not rows:
+        return
+    live_container.dataframe(
+        pd.DataFrame(rows)[["Ürün adı", "Trendyol linki", "Trendyol stoğu", "3 günlük satış"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Trendyol linki": st.column_config.LinkColumn("Trendyol linki", display_text="Aç"),
+        },
+    )
+
+
+def iter_nks_candidate_products(brand_name, category_ids, product_limit, saved_ids=None, status_container=None):
+    saved_ids = {str(product_id) for product_id in (saved_ids or set()) if str(product_id).strip()}
+    seen = set(saved_ids)
+    yielded = 0
+    brand_url = BRAND_STOCK_BRANDS.get(brand_name)
+    selected_category_ids = [str(category_id) for category_id in (category_ids or [])]
+    pages = max(1, int((int(product_limit) + len(saved_ids) + BRAND_STOCK_PRODUCTS_PER_PAGE - 1) // BRAND_STOCK_PRODUCTS_PER_PAGE) + 8)
+
+    def emit_products(page_products):
+        nonlocal yielded
+        for product in page_products:
+            product_id = str(product.get("Ürün ID") or "").strip()
+            if not product_id or product_id in seen:
+                continue
+            seen.add(product_id)
+            yielded += 1
+            yield {**product, "Sıra": yielded}
+            if yielded >= int(product_limit):
+                return
+
+    category_targets = selected_category_ids or [None]
+    for category_id in category_targets:
+        if status_container:
+            category_label = category_id or "tüm kategoriler"
+            status_container.write(f"{brand_name}: {category_label} içinde ürünler sayfa sayfa çekiliyor...")
+
+        if brand_url:
+            try:
+                referer = with_brand_page_category_query(brand_url, category_id, 1) if category_id else brand_url
+                cookie_header = trendyol_cookie_header(referer)
+                path_model = path_model_from_url(brand_url)
+                for page_no in range(1, pages + 1):
+                    page_products, _ = request_sfint_products_page(
+                        path_model,
+                        page_no,
+                        category_id=category_id,
+                        cookie_header=cookie_header,
+                        referer=referer,
+                    )
+                    if not page_products:
+                        break
+                    for product in emit_products(page_products):
+                        yield product
+                    if yielded >= int(product_limit):
+                        return
+            except Exception:
+                pass
+
+        for page_no in range(1, pages + 1):
+            page_products = []
+            try:
+                if category_id:
+                    page_products = request_search_products_page(brand_name, page_no, category_id=category_id)
+                else:
+                    page_products = request_search_products_page(brand_name, page_no)
+            except Exception:
+                page_products = []
+            if not page_products:
+                break
+            for product in emit_products(page_products):
+                yield product
+            if yielded >= int(product_limit):
+                return
+
+
+def nks_stock_rows_stream(brand_name, category_ids, product_limit, saved_ids=None, status_container=None, delay_seconds=10, live_container=None):
+    rows = []
+    errors = []
+    for product in iter_nks_candidate_products(
+        brand_name,
+        category_ids,
+        product_limit,
+        saved_ids=saved_ids,
+        status_container=status_container,
+    ):
+        if status_container:
+            status_container.write(f"Yeni ürün bulundu: {product.get('Ürün ID')}. Stok okunuyor...")
+        row, error = read_product_trendyol_stock(product, None)
+        if error:
+            errors.append(error)
+            continue
+        if not row:
+            continue
+        row["Marka"] = row.get("Marka") or product.get("Marka") or brand_name
+        if status_container:
+            status_container.write(f"Nekadarsatti sorgulanıyor: {row.get('Ürün ID')}")
+        try:
+            sales_row = fetch_nekadarsatti_sales(
+                {
+                    "Ürün ID": row["Ürün ID"],
+                    "Ürün": row["Ürün adı"],
+                    "Link": row["Trendyol linki"],
+                }
+            )
+            row["3 günlük satış"] = sales_row.get("3 günlük satış")
+        except Exception as exc:
+            errors.append(
+                {
+                    "Ürün ID": row["Ürün ID"],
+                    "Ürün": row["Ürün adı"],
+                    "Hata": str(exc),
+                    "Link": row["Trendyol linki"],
+                }
+            )
+        rows.append(row)
+        upsert_nks_stock_rows([row])
+        render_nks_live_rows(rows, live_container)
+        if len(rows) < int(product_limit) and delay_seconds > 0:
+            time.sleep(delay_seconds)
+    return rows, errors
+
+
 def unique_products(products):
     seen = set()
     unique_rows = []
@@ -2494,6 +2808,89 @@ def unique_products(products):
         seen.add(signature)
         unique_rows.append({**product, "Sıra": len(unique_rows) + 1})
     return unique_rows
+
+
+def discover_brand_stock_candidates(selected_brand_names, category_ids, product_limit):
+    brand_stock_pages = max(
+        1,
+        int((int(product_limit) + BRAND_STOCK_PRODUCTS_PER_PAGE - 1) // BRAND_STOCK_PRODUCTS_PER_PAGE),
+    )
+    products = []
+    per_brand_limit = int(product_limit)
+    selected_category_ids = [str(category_id) for category_id in (category_ids or [])]
+
+    for brand_name in selected_brand_names:
+        brand_url = BRAND_STOCK_BRANDS.get(brand_name)
+        if selected_category_ids:
+            for category_id in selected_category_ids:
+                category_url = category_url_by_id(category_id)
+                category_products = []
+                if brand_url:
+                    try:
+                        category_products = discover_brand_sfint_products(
+                            brand_url,
+                            category_id=category_id,
+                            pages=brand_stock_pages,
+                            limit=per_brand_limit,
+                            workers=BRAND_STOCK_WORKERS,
+                        )
+                    except Exception:
+                        category_products = []
+                if not category_products and brand_url:
+                    category_products = discover_brand_page_category_products(
+                        brand_url,
+                        category_id,
+                        brand_stock_pages,
+                        per_brand_limit,
+                        workers=BRAND_STOCK_WORKERS,
+                    )
+                if not category_products and category_url:
+                    category_products = discover_brand_category_products(
+                        category_url,
+                        brand_name,
+                        brand_stock_pages,
+                        per_brand_limit,
+                        workers=BRAND_STOCK_WORKERS,
+                    )
+                if not category_products:
+                    category_products = discover_search_products_fast(
+                        brand_name,
+                        brand_stock_pages,
+                        per_brand_limit,
+                        workers=BRAND_STOCK_WORKERS,
+                        category_id=category_id,
+                    )
+                products.extend(category_products)
+        elif brand_url:
+            try:
+                brand_products = discover_brand_sfint_products(
+                    brand_url,
+                    pages=brand_stock_pages,
+                    limit=per_brand_limit,
+                    workers=BRAND_STOCK_WORKERS,
+                )
+            except Exception:
+                brand_products = []
+            if not brand_products:
+                brand_products = discover_category_products_fast(
+                    brand_url,
+                    brand_stock_pages,
+                    per_brand_limit,
+                    None,
+                    workers=BRAND_STOCK_WORKERS,
+                )
+            products.extend(brand_products)
+        else:
+            products.extend(
+                discover_search_products_fast(
+                    brand_name,
+                    brand_stock_pages,
+                    per_brand_limit,
+                    workers=BRAND_STOCK_WORKERS,
+                )
+            )
+
+    return unique_products(products)[: int(product_limit)]
 
 
 def dataframe_download(df):
@@ -2565,6 +2962,70 @@ CREATE TABLE IF NOT EXISTS favorites (
 )
 """
 
+STOCK_TRACKING_BRANDS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS stock_tracking_brands (
+    brand_name TEXT PRIMARY KEY,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+)
+"""
+
+STOCK_TRACKING_SNAPSHOTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS stock_tracking_snapshots (
+    snapshot_at TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    product_name TEXT,
+    brand TEXT,
+    category TEXT,
+    link TEXT,
+    top_seller TEXT,
+    top_stock INTEGER,
+    total_stock INTEGER,
+    seller_stocks TEXT,
+    source TEXT,
+    payload TEXT NOT NULL,
+    PRIMARY KEY (snapshot_at, product_id)
+)
+"""
+
+ENGLISH_HOME_ITEMS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS english_home_stock_items (
+    product_id TEXT PRIMARY KEY,
+    product_name TEXT,
+    brand TEXT,
+    category TEXT,
+    trendyol_link TEXT,
+    english_home_link TEXT,
+    barcode TEXT,
+    trendyol_stock INTEGER,
+    website_stock INTEGER,
+    updated_at TEXT NOT NULL,
+    payload TEXT NOT NULL
+)
+"""
+
+NKS_STOCK_ITEMS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS nks_stock_items (
+    product_id TEXT PRIMARY KEY,
+    product_name TEXT,
+    brand TEXT,
+    category TEXT,
+    trendyol_link TEXT,
+    trendyol_stock INTEGER,
+    nks_sales_3d INTEGER,
+    updated_at TEXT NOT NULL,
+    payload TEXT NOT NULL
+)
+"""
+
+APP_SETTINGS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS app_settings (
+    setting_key TEXT PRIMARY KEY,
+    setting_value TEXT,
+    updated_at TEXT NOT NULL
+)
+"""
+
 
 def favorites_connection():
     if FAVORITES_DATABASE_URL:
@@ -2573,6 +3034,11 @@ def favorites_connection():
         connection = psycopg2.connect(FAVORITES_DATABASE_URL)
         with connection.cursor() as cursor:
             cursor.execute(FAVORITES_TABLE_SQL)
+            cursor.execute(STOCK_TRACKING_BRANDS_TABLE_SQL)
+            cursor.execute(STOCK_TRACKING_SNAPSHOTS_TABLE_SQL)
+            cursor.execute(ENGLISH_HOME_ITEMS_TABLE_SQL)
+            cursor.execute(NKS_STOCK_ITEMS_TABLE_SQL)
+            cursor.execute(APP_SETTINGS_TABLE_SQL)
         connection.commit()
         return connection
 
@@ -2580,11 +3046,772 @@ def favorites_connection():
     connection = sqlite3.connect(FAVORITES_DB_PATH, timeout=30)
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute(FAVORITES_TABLE_SQL)
+    connection.execute(STOCK_TRACKING_BRANDS_TABLE_SQL)
+    connection.execute(STOCK_TRACKING_SNAPSHOTS_TABLE_SQL)
+    connection.execute(ENGLISH_HOME_ITEMS_TABLE_SQL)
+    connection.execute(NKS_STOCK_ITEMS_TABLE_SQL)
+    connection.execute(APP_SETTINGS_TABLE_SQL)
     return connection
 
 
 def favorites_uses_postgres(connection):
     return connection.__class__.__module__.startswith("psycopg")
+
+
+def app_setting(key, default=None):
+    with favorites_connection() as connection:
+        if favorites_uses_postgres(connection):
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT setting_value FROM app_settings WHERE setting_key = %s",
+                    (key,),
+                )
+                row = cursor.fetchone()
+        else:
+            row = connection.execute(
+                "SELECT setting_value FROM app_settings WHERE setting_key = ?",
+                (key,),
+            ).fetchone()
+    if not row:
+        return default
+    return row[0]
+
+
+def save_app_setting(key, value):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with favorites_connection() as connection:
+        if favorites_uses_postgres(connection):
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (setting_key) DO UPDATE SET
+                        setting_value = EXCLUDED.setting_value,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (key, value, now),
+                )
+        else:
+            connection.execute(
+                """
+                INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, now),
+            )
+        connection.commit()
+
+
+def nks_stock_saved_rows():
+    with favorites_connection() as connection:
+        query = """
+        SELECT
+            product_id, product_name, brand, category, trendyol_link,
+            trendyol_stock, nks_sales_3d, updated_at, payload
+        FROM nks_stock_items
+        ORDER BY updated_at DESC
+        """
+        if favorites_uses_postgres(connection):
+            with connection.cursor() as cursor:
+                cursor.execute(query)
+                rows = cursor.fetchall()
+        else:
+            rows = connection.execute(query).fetchall()
+
+    output = []
+    for product_id, product_name, brand, category, trendyol_link, trendyol_stock, nks_sales_3d, updated_at, payload in rows:
+        try:
+            record = json.loads(payload)
+        except json.JSONDecodeError:
+            record = {}
+        record.update(
+            {
+                "Ürün ID": product_id,
+                "Ürün adı": best_product_name(record.get("Ürün adı"), product_name),
+                "Marka": record.get("Marka") or brand or "Karaca",
+                "Kategori": record.get("Kategori") or category,
+                "Trendyol linki": record.get("Trendyol linki") or trendyol_link,
+                "Trendyol stoğu": record.get("Trendyol stoğu") if record.get("Trendyol stoğu") is not None else trendyol_stock,
+                "3 günlük satış": record.get("3 günlük satış") if record.get("3 günlük satış") is not None else nks_sales_3d,
+                "Son güncelleme": updated_at,
+            }
+        )
+        output.append(record)
+    return output
+
+
+def nks_saved_product_ids(brand_name=None):
+    rows = nks_stock_saved_rows()
+    target_brand = str(brand_name or "").casefold()
+    saved_ids = set()
+    for row in rows:
+        if target_brand and str(row.get("Marka") or "").casefold() != target_brand:
+            continue
+        product_id = str(row.get("Ürün ID") or "").strip()
+        if product_id:
+            saved_ids.add(product_id)
+    return saved_ids
+
+
+def upsert_nks_stock_rows(rows):
+    clean_rows = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for row in rows:
+        record = json_safe(dict(row))
+        product_id = str(record.get("Ürün ID") or "").strip()
+        if not product_id:
+            continue
+        clean_rows.append(record)
+    if not clean_rows:
+        return 0
+
+    with favorites_connection() as connection:
+        use_postgres = favorites_uses_postgres(connection)
+        postgres_sql = """
+            INSERT INTO nks_stock_items (
+                product_id, product_name, brand, category, trendyol_link,
+                trendyol_stock, nks_sales_3d, updated_at, payload
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (product_id) DO UPDATE SET
+                product_name = EXCLUDED.product_name,
+                brand = EXCLUDED.brand,
+                category = EXCLUDED.category,
+                trendyol_link = EXCLUDED.trendyol_link,
+                trendyol_stock = EXCLUDED.trendyol_stock,
+                nks_sales_3d = EXCLUDED.nks_sales_3d,
+                updated_at = EXCLUDED.updated_at,
+                payload = EXCLUDED.payload
+        """
+        sqlite_sql = """
+            INSERT INTO nks_stock_items (
+                product_id, product_name, brand, category, trendyol_link,
+                trendyol_stock, nks_sales_3d, updated_at, payload
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(product_id) DO UPDATE SET
+                product_name = excluded.product_name,
+                brand = excluded.brand,
+                category = excluded.category,
+                trendyol_link = excluded.trendyol_link,
+                trendyol_stock = excluded.trendyol_stock,
+                nks_sales_3d = excluded.nks_sales_3d,
+                updated_at = excluded.updated_at,
+                payload = excluded.payload
+        """
+        cursor = connection.cursor() if use_postgres else None
+        for record in clean_rows:
+            params = (
+                str(record.get("Ürün ID")),
+                record.get("Ürün adı"),
+                record.get("Marka"),
+                record.get("Kategori"),
+                record.get("Trendyol linki"),
+                safe_int(record.get("Trendyol stoğu")),
+                safe_int(record.get("3 günlük satış")),
+                now,
+                json.dumps(record, ensure_ascii=False),
+            )
+            if use_postgres:
+                cursor.execute(postgres_sql, params)
+            else:
+                connection.execute(sqlite_sql, params)
+        if cursor:
+            cursor.close()
+        connection.commit()
+    return len(clean_rows)
+
+
+def seed_stock_tracking_brands():
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with favorites_connection() as connection:
+        use_postgres = favorites_uses_postgres(connection)
+        sql = (
+            """
+            INSERT INTO stock_tracking_brands (brand_name, active, created_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (brand_name) DO NOTHING
+            """
+            if use_postgres
+            else """
+            INSERT OR IGNORE INTO stock_tracking_brands (brand_name, active, created_at)
+            VALUES (?, ?, ?)
+            """
+        )
+        params = [(brand, 1, now) for brand in STOCK_TRACKING_INITIAL_BRANDS]
+        if use_postgres:
+            with connection.cursor() as cursor:
+                cursor.executemany(sql, params)
+        else:
+            connection.executemany(sql, params)
+        connection.commit()
+
+
+def stock_tracking_brand_rows():
+    seed_stock_tracking_brands()
+    with favorites_connection() as connection:
+        if favorites_uses_postgres(connection):
+            query = """
+            SELECT brand_name, active, created_at
+            FROM stock_tracking_brands
+            ORDER BY LOWER(brand_name)
+            """
+            with connection.cursor() as cursor:
+                cursor.execute(query)
+                rows = cursor.fetchall()
+        else:
+            query = """
+            SELECT brand_name, active, created_at
+            FROM stock_tracking_brands
+            ORDER BY brand_name COLLATE NOCASE
+            """
+            rows = connection.execute(query).fetchall()
+    return [
+        {"Marka": brand_name, "Aktif": bool(active), "Eklenme": created_at}
+        for brand_name, active, created_at in rows
+    ]
+
+
+def add_stock_tracking_brands(brand_names):
+    clean_names = []
+    seen = set()
+    for brand_name in brand_names:
+        clean_name = str(brand_name or "").strip()
+        key = clean_name.lower()
+        if clean_name and key not in seen:
+            clean_names.append(clean_name)
+            seen.add(key)
+    if not clean_names:
+        return 0
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with favorites_connection() as connection:
+        use_postgres = favorites_uses_postgres(connection)
+        sql = (
+            """
+            INSERT INTO stock_tracking_brands (brand_name, active, created_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (brand_name) DO UPDATE SET active = 1
+            """
+            if use_postgres
+            else """
+            INSERT OR REPLACE INTO stock_tracking_brands (brand_name, active, created_at)
+            VALUES (?, ?, COALESCE(
+                (SELECT created_at FROM stock_tracking_brands WHERE brand_name = ?),
+                ?
+            ))
+            """
+        )
+        if use_postgres:
+            params = [(brand_name, 1, now) for brand_name in clean_names]
+            with connection.cursor() as cursor:
+                cursor.executemany(sql, params)
+        else:
+            params = [(brand_name, 1, brand_name, now) for brand_name in clean_names]
+            connection.executemany(sql, params)
+        connection.commit()
+    return len(clean_names)
+
+
+def save_stock_tracking_snapshot(rows, source="Marka ve stok"):
+    snapshot_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    saved = 0
+    with favorites_connection() as connection:
+        use_postgres = favorites_uses_postgres(connection)
+        postgres_sql = """
+            INSERT INTO stock_tracking_snapshots (
+                snapshot_at, product_id, product_name, brand, category, link,
+                top_seller, top_stock, total_stock, seller_stocks, source, payload
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (snapshot_at, product_id) DO UPDATE SET
+                product_name = EXCLUDED.product_name,
+                brand = EXCLUDED.brand,
+                category = EXCLUDED.category,
+                link = EXCLUDED.link,
+                top_seller = EXCLUDED.top_seller,
+                top_stock = EXCLUDED.top_stock,
+                total_stock = EXCLUDED.total_stock,
+                seller_stocks = EXCLUDED.seller_stocks,
+                source = EXCLUDED.source,
+                payload = EXCLUDED.payload
+        """
+        sqlite_sql = """
+            INSERT OR REPLACE INTO stock_tracking_snapshots (
+                snapshot_at, product_id, product_name, brand, category, link,
+                top_seller, top_stock, total_stock, seller_stocks, source, payload
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        cursor = connection.cursor() if use_postgres else None
+        for row in rows:
+            record = json_safe(dict(row))
+            product_id = str(record.get("Ürün ID") or "").strip()
+            if not product_id:
+                continue
+            params = (
+                snapshot_at,
+                product_id,
+                record.get("Ürün"),
+                record.get("Marka"),
+                record.get("Kategori"),
+                record.get("Link"),
+                record.get("En yüksek stok satıcısı"),
+                record.get("En yüksek stok"),
+                record.get("Toplam stok"),
+                record.get("Satıcı stokları"),
+                source,
+                json.dumps(record, ensure_ascii=False),
+            )
+            if use_postgres:
+                cursor.execute(postgres_sql, params)
+            else:
+                connection.execute(sqlite_sql, params)
+            saved += 1
+        if cursor:
+            cursor.close()
+        connection.commit()
+    return saved, snapshot_at
+
+
+def stock_tracking_snapshot_rows(limit=10000):
+    with favorites_connection() as connection:
+        query = """
+        SELECT
+            snapshot_at, product_id, product_name, brand, category, link,
+            top_seller, top_stock, total_stock, seller_stocks, source, payload
+        FROM stock_tracking_snapshots
+        ORDER BY snapshot_at DESC
+        LIMIT %s
+        """
+        sqlite_query = query.replace("LIMIT %s", "LIMIT ?")
+        if favorites_uses_postgres(connection):
+            with connection.cursor() as cursor:
+                cursor.execute(query, (int(limit),))
+                rows = cursor.fetchall()
+        else:
+            rows = connection.execute(sqlite_query, (int(limit),)).fetchall()
+
+    output = []
+    for (
+        snapshot_at,
+        product_id,
+        product_name,
+        brand,
+        category,
+        link,
+        top_seller,
+        top_stock,
+        total_stock,
+        seller_stocks,
+        source,
+        payload,
+    ) in rows:
+        try:
+            record = json.loads(payload)
+        except json.JSONDecodeError:
+            record = {}
+        record.update(
+            {
+                "Kayıt zamanı": snapshot_at,
+                "Ürün ID": product_id,
+                "Ürün": record.get("Ürün") or product_name,
+                "Marka": record.get("Marka") or brand,
+                "Kategori": record.get("Kategori") or category,
+                "Link": record.get("Link") or link,
+                "En yüksek stok satıcısı": record.get("En yüksek stok satıcısı") or top_seller,
+                "En yüksek stok": record.get("En yüksek stok") or top_stock,
+                "Toplam stok": record.get("Toplam stok") or total_stock,
+                "Satıcı stokları": record.get("Satıcı stokları") or seller_stocks,
+                "Kaynak": source,
+            }
+        )
+        output.append(record)
+    return add_stock_tracking_deltas(output)
+
+
+ENGLISH_HOME_CATEGORY_URLS = [
+    "https://www.englishhome.com/havlu",
+    "https://www.englishhome.com/havlu/yuz-havlusu/",
+    "https://www.englishhome.com/havlu/el-havlusu/",
+    "https://www.englishhome.com/havlu/banyo-havlusu/",
+    "https://www.englishhome.com/nevresim-takimi",
+    "https://www.englishhome.com/nevresim-seti",
+    "https://www.englishhome.com/pike",
+    "https://www.englishhome.com/yatak-ortusu",
+    "https://www.englishhome.com/battaniye",
+    "https://www.englishhome.com/yastik",
+    "https://www.englishhome.com/yastik-kilifi",
+    "https://www.englishhome.com/lastikli-carsaf",
+    "https://www.englishhome.com/alez",
+    "https://www.englishhome.com/bornoz",
+    "https://www.englishhome.com/banyo-aksesuarlari",
+    "https://www.englishhome.com/banyo-paspasi",
+    "https://www.englishhome.com/mutfak-tekstili",
+    "https://www.englishhome.com/mutfak-havlusu",
+    "https://www.englishhome.com/masa-ortusu",
+    "https://www.englishhome.com/runner",
+    "https://www.englishhome.com/kupa",
+    "https://www.englishhome.com/bardak",
+    "https://www.englishhome.com/kase",
+    "https://www.englishhome.com/tabak",
+]
+
+
+def normalized_match_text(value):
+    text = clean_text(value) or ""
+    replacements = {
+        "ı": "i",
+        "ğ": "g",
+        "ü": "u",
+        "ş": "s",
+        "ö": "o",
+        "ç": "c",
+        "İ": "i",
+        "I": "i",
+    }
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    text = text.casefold()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def english_home_category_candidates(product_name):
+    text = normalized_match_text(product_name)
+    weighted = []
+    keyword_map = [
+        ("havlu", ["havlu"]),
+        ("nevresim", ["nevresim-takimi", "nevresim-seti"]),
+        ("pike", ["pike"]),
+        ("yatak ortusu", ["yatak-ortusu"]),
+        ("battaniye", ["battaniye"]),
+        ("yastik kilifi", ["yastik-kilifi"]),
+        ("yastik", ["yastik"]),
+        ("carsaf", ["lastikli-carsaf"]),
+        ("alez", ["alez"]),
+        ("bornoz", ["bornoz"]),
+        ("paspas", ["banyo-paspasi"]),
+        ("kupa", ["kupa"]),
+        ("bardak", ["bardak"]),
+        ("kase", ["kase"]),
+        ("tabak", ["tabak"]),
+        ("runner", ["runner"]),
+        ("masa ortusu", ["masa-ortusu"]),
+    ]
+    for keyword, slugs in keyword_map:
+        if keyword in text:
+            for slug in slugs:
+                weighted.append(f"https://www.englishhome.com/{slug}")
+
+    urls = []
+    for url in weighted + ENGLISH_HOME_CATEGORY_URLS:
+        if url not in urls:
+            urls.append(url)
+    return urls[:8]
+
+
+def parse_english_home_stock(source_text):
+    text = clean_text(source_text) or ""
+    stock = None
+    barcode = None
+    product_code = None
+
+    stock_match = re.search(r"Toplam\s+Stok\s+Adedi\s*:?\s*([\d.]+)", text, flags=re.IGNORECASE)
+    if stock_match:
+        stock = parse_compact_number(stock_match.group(1))
+
+    barcode_match = re.search(r"Barkod\s*:?\s*(\d{8,20})", text, flags=re.IGNORECASE)
+    if barcode_match:
+        barcode = barcode_match.group(1)
+
+    product_code_match = re.search(r"\((0{3,}\d{6,})\)", text)
+    if product_code_match:
+        product_code = product_code_match.group(1)
+
+    return {"website_stock": stock, "barcode": barcode, "product_code": product_code}
+
+
+def parse_english_home_listing_links(source_text):
+    decoded = html.unescape(source_text or "").replace("\\/", "/")
+    matches = list(re.finditer(r'href=["\']([^"\']+-\d{3,6})(?:["\']|\?)', decoded, flags=re.IGNORECASE))
+    products = []
+    seen = set()
+    for match in matches:
+        url = urljoin("https://www.englishhome.com/", match.group(1))
+        if url in seen:
+            continue
+        seen.add(url)
+        context = decoded[max(0, match.start() - 700) : min(len(decoded), match.end() + 700)]
+        title = extract_title_from_context(context)
+        if title == "Trendyol ürünü":
+            title = clean_text(re.sub(r"-\d+$", "", urlparse(url).path.strip("/")).replace("-", " "))
+        products.append({"title": title, "url": url})
+    return products
+
+
+def discover_english_home_product_link(product_name, barcode=None):
+    target = normalized_match_text(product_name)
+    if not target:
+        return None
+
+    best = {"score": 0, "url": None}
+    for category_url in english_home_category_candidates(product_name):
+        try:
+            source = request_page(category_url)
+        except Exception:
+            continue
+        for item in parse_english_home_listing_links(source):
+            candidate_title = item.get("title") or ""
+            candidate = normalized_match_text(candidate_title)
+            if not candidate:
+                continue
+            if candidate in target or target in candidate:
+                score = 1.0
+            else:
+                score = difflib.SequenceMatcher(None, target, candidate).ratio()
+            if score > best["score"]:
+                best = {"score": score, "url": item["url"]}
+        if best["score"] >= 0.9:
+            break
+
+    return best["url"] if best["score"] >= 0.74 else None
+
+
+def fetch_english_home_website_stock(product_name, existing_link=None, barcode=None):
+    link = existing_link or discover_english_home_product_link(product_name, barcode=barcode)
+    if not link:
+        return {"english_home_link": None, "website_stock": None, "barcode": barcode, "error": "English Home linki bulunamadı."}
+
+    try:
+        source = request_page(link)
+        parsed = parse_english_home_stock(source)
+        return {
+            "english_home_link": link,
+            "website_stock": parsed.get("website_stock"),
+            "barcode": parsed.get("barcode") or barcode,
+            "error": None if parsed.get("website_stock") is not None else "Web stok alanı bulunamadı.",
+        }
+    except Exception as exc:
+        return {"english_home_link": link, "website_stock": None, "barcode": barcode, "error": str(exc)}
+
+
+def english_home_stock_rows():
+    with favorites_connection() as connection:
+        query = """
+        SELECT
+            product_id, product_name, brand, category, trendyol_link, english_home_link,
+            barcode, trendyol_stock, website_stock, updated_at, payload
+        FROM english_home_stock_items
+        ORDER BY updated_at DESC
+        """
+        if favorites_uses_postgres(connection):
+            with connection.cursor() as cursor:
+                cursor.execute(query)
+                rows = cursor.fetchall()
+        else:
+            rows = connection.execute(query).fetchall()
+
+    output = []
+    for (
+        product_id,
+        product_name,
+        brand,
+        category,
+        trendyol_link,
+        english_home_link,
+        barcode,
+        trendyol_stock,
+        website_stock,
+        updated_at,
+        payload,
+    ) in rows:
+        try:
+            record = json.loads(payload)
+        except json.JSONDecodeError:
+            record = {}
+        record.update(
+            {
+                "Ürün ID": product_id,
+                "Ürün": record.get("Ürün") or product_name,
+                "Marka": record.get("Marka") or brand,
+                "Kategori": record.get("Kategori") or category,
+                "Trendyol link": record.get("Trendyol link") or trendyol_link,
+                "English Home link": record.get("English Home link") or english_home_link,
+                "Barkod": record.get("Barkod") or barcode,
+                "Trendyol stok": record.get("Trendyol stok") or trendyol_stock,
+                "Web sitesi stok": record.get("Web sitesi stok") or website_stock,
+                "Son güncelleme": updated_at,
+            }
+        )
+        output.append(record)
+    return output
+
+
+def upsert_english_home_stock_rows(rows):
+    clean_rows = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for row in rows:
+        record = json_safe(dict(row))
+        brand = str(record.get("Marka") or "").strip()
+        if brand.casefold() != "english home":
+            continue
+        product_id = str(record.get("Ürün ID") or "").strip()
+        if not product_id:
+            continue
+        record["Trendyol link"] = record.get("Trendyol link") or record.get("Link")
+        record["Trendyol stok"] = record.get("Trendyol stok") or record.get("Toplam stok") or record.get("En yüksek stok")
+        clean_rows.append((product_id, record))
+
+    if not clean_rows:
+        return 0
+
+    with favorites_connection() as connection:
+        use_postgres = favorites_uses_postgres(connection)
+        postgres_sql = """
+            INSERT INTO english_home_stock_items (
+                product_id, product_name, brand, category, trendyol_link, english_home_link,
+                barcode, trendyol_stock, website_stock, updated_at, payload
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (product_id) DO UPDATE SET
+                product_name = EXCLUDED.product_name,
+                brand = EXCLUDED.brand,
+                category = EXCLUDED.category,
+                trendyol_link = COALESCE(EXCLUDED.trendyol_link, english_home_stock_items.trendyol_link),
+                english_home_link = COALESCE(EXCLUDED.english_home_link, english_home_stock_items.english_home_link),
+                barcode = COALESCE(EXCLUDED.barcode, english_home_stock_items.barcode),
+                trendyol_stock = COALESCE(EXCLUDED.trendyol_stock, english_home_stock_items.trendyol_stock),
+                website_stock = COALESCE(EXCLUDED.website_stock, english_home_stock_items.website_stock),
+                updated_at = EXCLUDED.updated_at,
+                payload = EXCLUDED.payload
+        """
+        sqlite_sql = """
+            INSERT INTO english_home_stock_items (
+                product_id, product_name, brand, category, trendyol_link, english_home_link,
+                barcode, trendyol_stock, website_stock, updated_at, payload
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(product_id) DO UPDATE SET
+                product_name = excluded.product_name,
+                brand = excluded.brand,
+                category = excluded.category,
+                trendyol_link = COALESCE(excluded.trendyol_link, english_home_stock_items.trendyol_link),
+                english_home_link = COALESCE(excluded.english_home_link, english_home_stock_items.english_home_link),
+                barcode = COALESCE(excluded.barcode, english_home_stock_items.barcode),
+                trendyol_stock = COALESCE(excluded.trendyol_stock, english_home_stock_items.trendyol_stock),
+                website_stock = COALESCE(excluded.website_stock, english_home_stock_items.website_stock),
+                updated_at = excluded.updated_at,
+                payload = excluded.payload
+        """
+        cursor = connection.cursor() if use_postgres else None
+        for _, record in clean_rows:
+            params = (
+                str(record.get("Ürün ID")),
+                record.get("Ürün"),
+                record.get("Marka"),
+                record.get("Kategori"),
+                record.get("Trendyol link"),
+                record.get("English Home link"),
+                record.get("Barkod"),
+                safe_int(record.get("Trendyol stok")),
+                safe_int(record.get("Web sitesi stok")),
+                now,
+                json.dumps(record, ensure_ascii=False),
+            )
+            if use_postgres:
+                cursor.execute(postgres_sql, params)
+            else:
+                connection.execute(sqlite_sql, params)
+        if cursor:
+            cursor.close()
+        connection.commit()
+    return len(clean_rows)
+
+
+def refresh_english_home_stock_items(rows, max_items=None, progress=None):
+    updated = []
+    errors = []
+    target_rows = list(rows)
+    if max_items:
+        target_rows = target_rows[: int(max_items)]
+
+    for index, row in enumerate(target_rows, start=1):
+        if progress:
+            progress.progress(index / max(len(target_rows), 1), text=f"{index}/{len(target_rows)} English Home stok güncelleniyor")
+        record = dict(row)
+
+        trendyol_link = record.get("Trendyol link") or record.get("Link")
+        if trendyol_link:
+            try:
+                source = fetch_page(trendyol_link)
+                _, seller_detail_rows, _ = analyze_source(source)
+                stocks = [
+                    int(value)
+                    for value in pd.to_numeric(
+                        pd.Series([seller_row.get("Quantity") for seller_row in seller_detail_rows]),
+                        errors="coerce",
+                    ).dropna()
+                ]
+                if stocks:
+                    record["Trendyol stok"] = sum(stocks)
+            except Exception as exc:
+                errors.append({"Ürün ID": record.get("Ürün ID"), "Alan": "Trendyol", "Hata": str(exc)})
+
+        web_result = fetch_english_home_website_stock(
+            record.get("Ürün"),
+            existing_link=record.get("English Home link"),
+            barcode=record.get("Barkod"),
+        )
+        if web_result.get("english_home_link"):
+            record["English Home link"] = web_result["english_home_link"]
+        if web_result.get("barcode"):
+            record["Barkod"] = web_result["barcode"]
+        if web_result.get("website_stock") is not None:
+            record["Web sitesi stok"] = web_result["website_stock"]
+        if web_result.get("error"):
+            errors.append({"Ürün ID": record.get("Ürün ID"), "Alan": "English Home", "Hata": web_result["error"]})
+
+        updated.append(record)
+
+    if progress:
+        progress.empty()
+    upsert_english_home_stock_rows(updated)
+    return updated, errors
+
+
+def add_stock_tracking_deltas(rows):
+    if not rows:
+        return rows
+
+    product_history = {}
+    for row in sorted(rows, key=lambda item: str(item.get("Kayıt zamanı") or "")):
+        product_id = str(row.get("Ürün ID") or "")
+        if not product_id:
+            continue
+
+        current_total_stock = pd.to_numeric(row.get("Toplam stok"), errors="coerce")
+        current_top_stock = pd.to_numeric(row.get("En yüksek stok"), errors="coerce")
+        current_stock = current_total_stock if pd.notna(current_total_stock) else current_top_stock
+
+        previous_rows = product_history.setdefault(product_id, [])
+        previous_row = previous_rows[-1] if previous_rows else None
+        if previous_row is not None and pd.notna(current_stock):
+            previous_total_stock = pd.to_numeric(previous_row.get("Toplam stok"), errors="coerce")
+            previous_top_stock = pd.to_numeric(previous_row.get("En yüksek stok"), errors="coerce")
+            previous_stock = previous_total_stock if pd.notna(previous_total_stock) else previous_top_stock
+            if pd.notna(previous_stock):
+                stock_diff = int(previous_stock) - int(current_stock)
+                row["Günlük satış"] = max(stock_diff, 0)
+                row["Önceki stok"] = int(previous_stock)
+                row["Stok farkı"] = stock_diff
+        previous_rows.append(row)
+
+    return rows
 
 
 def favorite_rows():
@@ -2835,6 +4062,13 @@ def product_link_column_config():
     }
 
 
+def english_home_link_column_config():
+    return {
+        "Trendyol link": st.column_config.LinkColumn("Trendyol", display_text="Aç"),
+        "English Home link": st.column_config.LinkColumn("English Home", display_text="Aç"),
+    }
+
+
 def favorite_editor(df, key):
     display_df = display_product_links(df)
     if display_df.empty:
@@ -3061,7 +4295,7 @@ st.caption("Marka stoklarını tara, 3 günlük satış verisiyle eşleştir ve 
 
 selected_main_tab = st.radio(
     "Bölüm",
-    ["Marka ve stok", "Favoriler", "Kâr hesabı", "Tek ürün stok okuyucu"],
+    ["Marka ve stok", "NKS ve stok", "Favoriler", "Kâr hesabı", "Tek ürün stok okuyucu", "Ayarlar"],
     horizontal=True,
     label_visibility="collapsed",
     key="main_section",
@@ -3398,6 +4632,193 @@ if selected_main_tab == "Manuel ürün özeti":
                 mime="text/csv",
             )
 
+if selected_main_tab == "NKS ve stok":
+    st.subheader("NKS ve stok")
+    st.caption("Seçtiğin marka ürünlerinde Trendyol en yüksek satıcı stoğunu ve Nekadarsatti 3 günlük satış verisini yan yana gösterir.")
+
+    nks_brand_options = sorted(BRAND_STOCK_BRANDS.keys(), key=str.casefold)
+    nks_brand_col, nks_category_col, nks_count_col = st.columns([1, 1, 1])
+    with nks_brand_col:
+        nks_brand = st.selectbox(
+            "Marka",
+            options=nks_brand_options,
+            index=nks_brand_options.index("English Home") if "English Home" in nks_brand_options else 0,
+            key="nks_stock_brand",
+        )
+
+    nks_category_options = brand_stock_category_options([nks_brand])
+    with nks_category_col:
+        nks_category_choice = st.selectbox(
+            "Kategori (opsiyonel)",
+            options=[""] + list(nks_category_options.keys()),
+            format_func=lambda category_id: "Tüm kategoriler" if not category_id else nks_category_options.get(str(category_id), str(category_id)),
+            key="nks_stock_category",
+        )
+
+    with nks_count_col:
+        nks_product_limit = st.number_input(
+            "Ürün sayısı",
+            min_value=1,
+            max_value=10000,
+            value=30,
+            step=10,
+            key="nks_stock_product_limit",
+        )
+
+    if st.button("NKS ve stok sorgula", type="primary", use_container_width=True):
+        try:
+            selected_category_ids = [str(nks_category_choice)] if nks_category_choice else []
+            saved_ids_for_brand = nks_saved_product_ids(nks_brand)
+            live_container = st.empty()
+            with st.status("NKS ve stok sorgusu çalışıyor...", expanded=True) as status:
+                if saved_ids_for_brand:
+                    status.write(f"{len(saved_ids_for_brand)} kayıtlı ürün atlanacak.")
+                rows, errors = nks_stock_rows_stream(
+                    nks_brand,
+                    selected_category_ids,
+                    int(nks_product_limit),
+                    saved_ids=saved_ids_for_brand,
+                    status_container=status,
+                    delay_seconds=10,
+                    live_container=live_container,
+                )
+                if not rows:
+                    if errors:
+                        raise RuntimeError(
+                            "Yeni ürün bulundu ama stok/Nekadarsatti satırı oluşturulamadı. "
+                            f"İlk hata: {errors[0].get('Hata')}"
+                        )
+                    raise RuntimeError("Bu marka/kategoride kayıtlı olmayan yeni ürün bulunamadı.")
+                status.update(label="NKS ve stok sorgusu tamamlandı.", state="complete")
+
+            st.session_state["nks_stock_result"] = {
+                "rows": rows,
+                "errors": errors,
+                "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "brand": nks_brand,
+                "category": nks_category_options.get(str(nks_category_choice), "Tüm kategoriler") if nks_category_choice else "Tüm kategoriler",
+            }
+        except Exception as exc:
+            st.error(str(exc))
+
+    saved_nks_rows = nks_stock_saved_rows()
+    refresh_saved = st.button(
+        "Kayıtlı NKS ürünlerini güncelle",
+        type="secondary",
+        use_container_width=True,
+        disabled=not saved_nks_rows,
+    )
+    if refresh_saved:
+        try:
+            live_container = st.empty()
+            saved_products = [
+                {
+                    "Ürün ID": row.get("Ürün ID"),
+                    "Ürün": row.get("Ürün adı"),
+                    "Link": row.get("Trendyol linki"),
+                    "Marka": row.get("Marka"),
+                    "Kategori": row.get("Kategori"),
+                }
+                for row in saved_nks_rows
+            ]
+            with st.status("Kayıtlı ürünler güncelleniyor...", expanded=True) as status:
+                rows, errors = nks_stock_rows(
+                    saved_products,
+                    None,
+                    status_container=status,
+                    delay_seconds=10,
+                    live_container=live_container,
+                )
+                status.update(label="Kayıtlı NKS ürünleri güncellendi.", state="complete")
+            st.session_state["nks_stock_result"] = {
+                "rows": rows,
+                "errors": errors,
+                "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "brand": "Kayıtlı ürünler",
+                "category": "Kayıtlı ürünler",
+            }
+        except Exception as exc:
+            st.error(str(exc))
+
+    nks_result = st.session_state.get("nks_stock_result")
+    if nks_result:
+        result_df = pd.DataFrame(nks_result.get("rows", []))
+        errors_df = pd.DataFrame(nks_result.get("errors", []))
+        st.caption(
+            f"Son kontrol: {nks_result.get('checked_at')} | Marka: {nks_result.get('brand')} | "
+            f"Kategori: {nks_result.get('category')}"
+        )
+        if result_df.empty:
+            st.info("Sonuç bulunamadı.")
+        else:
+            display_df = result_df[["Ürün adı", "Trendyol linki", "Trendyol stoğu", "3 günlük satış"]].copy()
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Trendyol linki": st.column_config.LinkColumn("Trendyol linki", display_text="Aç"),
+                },
+            )
+            st.download_button(
+                "NKS ve stok Excel indir",
+                data=excel_download({"NKS ve stok": display_df}),
+                file_name="nks_ve_stok.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        with st.expander("Hatalar"):
+            if errors_df.empty:
+                st.success("Hata yok.")
+            else:
+                st.dataframe(
+                    display_product_links(errors_df),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config=product_link_column_config(),
+                )
+
+    saved_nks_df = pd.DataFrame(nks_stock_saved_rows())
+    if not saved_nks_df.empty:
+        st.divider()
+        st.subheader("Kayıtlı NKS ürünleri")
+        saved_nks_df["Marka"] = saved_nks_df["Marka"].fillna("Karaca").astype(str)
+        unknown_name_count = int((saved_nks_df["Ürün adı"].astype(str) == "Trendyol ürünü").sum())
+        if unknown_name_count:
+            st.warning(
+                f"{unknown_name_count} kayıt eski ürün adıyla duruyor. "
+                "Kayıtlı NKS ürünlerini güncelle butonuna basınca gerçek ürün adlarıyla düzelecek."
+            )
+        saved_brand_names = sorted(saved_nks_df["Marka"].unique(), key=str.casefold)
+        for saved_brand_name in saved_brand_names:
+            brand_saved_df = saved_nks_df[saved_nks_df["Marka"] == saved_brand_name].copy()
+            saved_display_df = brand_saved_df[
+                ["Ürün adı", "Trendyol linki", "Trendyol stoğu", "3 günlük satış", "Son güncelleme"]
+            ].copy()
+            with st.expander(f"{saved_brand_name} ({len(saved_display_df)} ürün)", expanded=saved_brand_name == "Karaca"):
+                st.dataframe(
+                    saved_display_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Trendyol linki": st.column_config.LinkColumn("Trendyol linki", display_text="Aç"),
+                    },
+                )
+        st.download_button(
+            "Kayıtlı NKS ürünlerini Excel indir",
+            data=excel_download(
+                {
+                    "Tüm kayıtlı ürünler": saved_nks_df,
+                    **{
+                        saved_brand_name: saved_nks_df[saved_nks_df["Marka"] == saved_brand_name]
+                        for saved_brand_name in saved_brand_names
+                    },
+                }
+            ),
+            file_name="kayitli_nks_urunleri.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
 if selected_main_tab == "Marka ve stok":
     st.subheader("Marka ve stok")
     st.caption("Seçtiğin markanın Trendyol marka sayfasını veya arama sonuçlarını tarar ve ürün max stoku belirlediğin eşiğin altında kalanları listeler.")
@@ -3546,90 +4967,18 @@ if selected_main_tab == "Marka ve stok":
                 or [str(category_id) for category_id in result.get("selected_category_ids", [])] != result_signature["category_ids"]
             ):
                 with st.status("Marka ürünleri çekiliyor...", expanded=True) as status:
-                    brand_stock_pages = max(
-                        1,
-                        int((brand_stock_product_limit + BRAND_STOCK_PRODUCTS_PER_PAGE - 1) // BRAND_STOCK_PRODUCTS_PER_PAGE),
+                    selected_category_ids = result_signature["category_ids"]
+                    selected_category_names = [
+                        brand_category_options.get(category_id, category_id)
+                        for category_id in selected_category_ids
+                    ]
+                    category_text = ", ".join(selected_category_names) if selected_category_names else "tüm kategoriler"
+                    st.write(f"{', '.join(selected_brand_names)}: {category_text} içinde ürünler çekiliyor...")
+                    products = discover_brand_stock_candidates(
+                        selected_brand_names,
+                        selected_category_ids,
+                        brand_stock_product_limit,
                     )
-                    products = []
-                    per_brand_limit = int(brand_stock_product_limit)
-                    for brand_name in selected_brand_names:
-                        brand_url = BRAND_STOCK_BRANDS.get(brand_name)
-                        selected_category_ids = result_signature["category_ids"]
-                        selected_category_names = [
-                            brand_category_options.get(category_id, category_id)
-                            for category_id in selected_category_ids
-                        ]
-                        category_text = ", ".join(selected_category_names) if selected_category_names else "tüm kategoriler"
-                        st.write(f"{brand_name}: {category_text} içinde ürünler çekiliyor...")
-                        if selected_category_ids:
-                            for category_id in selected_category_ids:
-                                category_url = category_url_by_id(category_id)
-                                category_products = []
-                                if brand_url:
-                                    try:
-                                        category_products = discover_brand_sfint_products(
-                                            brand_url,
-                                            category_id=category_id,
-                                            pages=brand_stock_pages,
-                                            limit=per_brand_limit,
-                                            workers=BRAND_STOCK_WORKERS,
-                                        )
-                                    except Exception:
-                                        category_products = []
-                                if not category_products and brand_url:
-                                    category_products = discover_brand_page_category_products(
-                                        brand_url,
-                                        category_id,
-                                        brand_stock_pages,
-                                        per_brand_limit,
-                                        workers=BRAND_STOCK_WORKERS,
-                                    )
-                                if not category_products and category_url:
-                                    category_products = discover_brand_category_products(
-                                        category_url,
-                                        brand_name,
-                                        brand_stock_pages,
-                                        per_brand_limit,
-                                        workers=BRAND_STOCK_WORKERS,
-                                    )
-                                if not category_products:
-                                    category_products = discover_search_products_fast(
-                                        brand_name,
-                                        brand_stock_pages,
-                                        per_brand_limit,
-                                        workers=BRAND_STOCK_WORKERS,
-                                        category_id=category_id,
-                                    )
-                                products.extend(category_products)
-                        elif brand_url:
-                            try:
-                                brand_products = discover_brand_sfint_products(
-                                    brand_url,
-                                    pages=brand_stock_pages,
-                                    limit=per_brand_limit,
-                                    workers=BRAND_STOCK_WORKERS,
-                                )
-                            except Exception:
-                                brand_products = []
-                            if not brand_products:
-                                brand_products = discover_category_products_fast(
-                                    brand_url,
-                                    brand_stock_pages,
-                                    per_brand_limit,
-                                    None,
-                                    workers=BRAND_STOCK_WORKERS,
-                                )
-                            products.extend(brand_products)
-                        else:
-                            products.extend(
-                                discover_search_products_fast(
-                                    brand_name,
-                                    brand_stock_pages,
-                                    per_brand_limit,
-                                    workers=BRAND_STOCK_WORKERS,
-                                )
-                            )
-                    products = unique_products(products)[: int(brand_stock_product_limit)]
                     if not products:
                         raise RuntimeError("Marka sayfasından ürün linki çıkarılamadı.")
                     st.write(f"{len(products)} ürün bulundu.")
@@ -3860,6 +5209,79 @@ if selected_main_tab == "Marka ve stok":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
+            st.divider()
+            st.subheader("English Home stok karşılaştırma")
+            st.caption(
+                "English Home ürünlerini burada kalıcı tutar; Trendyol stoku, English Home web stok alanı ve iki link birlikte izlenir."
+            )
+            english_home_summary_df = filtered_summary_df[
+                filtered_summary_df.get("Marka", pd.Series(dtype=object)).astype(str).str.casefold() == "english home"
+            ].copy()
+            english_save_col, english_refresh_col = st.columns([1, 1])
+            with english_save_col:
+                if st.button(
+                    "Bu taramadaki English Home ürünlerini listeye kaydet",
+                    use_container_width=True,
+                    disabled=english_home_summary_df.empty,
+                ):
+                    save_rows = english_home_summary_df.rename(
+                        columns={"Link": "Trendyol link", "Toplam stok": "Trendyol stok"}
+                    ).to_dict("records")
+                    saved_count = upsert_english_home_stock_rows(save_rows)
+                    st.success(f"{saved_count} English Home ürünü kalıcı listeye kaydedildi.")
+                    time.sleep(0.2)
+                    st.rerun()
+
+            saved_english_home_rows = english_home_stock_rows()
+            with english_refresh_col:
+                if st.button(
+                    "Kalıcı English Home listesinin stoklarını güncelle",
+                    type="secondary",
+                    use_container_width=True,
+                    disabled=not saved_english_home_rows,
+                ):
+                    refresh_progress = st.progress(0, text="English Home stokları güncelleniyor")
+                    _, refresh_errors = refresh_english_home_stock_items(saved_english_home_rows, progress=refresh_progress)
+                    if refresh_errors:
+                        st.warning(f"Güncelleme bitti; {len(refresh_errors)} alanda veri alınamadı.")
+                    else:
+                        st.success("English Home stokları güncellendi.")
+                    time.sleep(0.2)
+                    st.rerun()
+
+            saved_english_home_df = pd.DataFrame(english_home_stock_rows())
+            if saved_english_home_df.empty:
+                st.info("Kalıcı English Home listesi boş. Önce English Home marka taraması yapıp çıkan ürünleri listeye kaydet.")
+            else:
+                english_default_columns = [
+                    "Ürün ID",
+                    "Ürün",
+                    "Kategori",
+                    "Trendyol stok",
+                    "Web sitesi stok",
+                    "Barkod",
+                    "Son güncelleme",
+                    "Trendyol link",
+                    "English Home link",
+                ]
+                english_filtered_df = configurable_table(
+                    saved_english_home_df,
+                    "english_home_stock_compare",
+                    english_default_columns,
+                )
+                st.dataframe(
+                    english_filtered_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config=english_home_link_column_config(),
+                )
+                st.download_button(
+                    "English Home stok karşılaştırmasını Excel indir",
+                    data=excel_download({"English Home": english_filtered_df}),
+                    file_name="english_home_stok_karsilastirma.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
         with st.expander("Satıcı/varyant detayları"):
             if checked_df.empty:
                 st.info("Detay satırı yok.")
@@ -3899,6 +5321,217 @@ if selected_main_tab == "Marka ve stok":
                     hide_index=True,
                     column_config=product_link_column_config(),
                 )
+
+if selected_main_tab == "Stok takibi":
+    st.subheader("Stok takibi")
+    st.caption("Takip edilecek markaları ve kaydettiğin stok geçmişini burada tutar.")
+
+    seed_stock_tracking_brands()
+    brand_rows_df = pd.DataFrame(stock_tracking_brand_rows())
+    st.markdown("#### Takip edilen markalar")
+    if brand_rows_df.empty:
+        st.info("Henüz takip edilen marka yok.")
+    else:
+        st.dataframe(brand_rows_df, use_container_width=True, hide_index=True)
+
+    with st.form("stock_tracking_brand_form"):
+        new_brands_text = st.text_input(
+            "Yeni marka ekle",
+            placeholder="Örn: Kütahya Porselen, Schafer",
+        )
+        submitted = st.form_submit_button("Markaları ekle", type="secondary", use_container_width=True)
+    if submitted:
+        added_count = add_stock_tracking_brands(new_brands_text.split(","))
+        if added_count:
+            st.success(f"{added_count} marka takip listesine eklendi.")
+            st.rerun()
+        else:
+            st.warning("Eklenecek marka yazmadın.")
+
+    st.markdown("#### Verileri çek")
+    tracked_brand_options = brand_rows_df["Marka"].tolist() if "Marka" in brand_rows_df.columns else STOCK_TRACKING_INITIAL_BRANDS
+    default_tracking_brands = [
+        brand for brand in STOCK_TRACKING_INITIAL_BRANDS if brand in tracked_brand_options
+    ] or tracked_brand_options[:1]
+    track_col_brand, track_col_stock, track_col_limit = st.columns([1.2, 0.8, 0.8])
+    with track_col_brand:
+        tracking_selected_brands = st.multiselect(
+            "Marka",
+            options=tracked_brand_options,
+            default=default_tracking_brands,
+            key="stock_tracking_selected_brands",
+        )
+    with track_col_stock:
+        tracking_max_stock = st.number_input(
+            "Maksimum ürün stoku",
+            min_value=1,
+            max_value=100000,
+            value=150,
+            step=10,
+            key="stock_tracking_max_stock",
+        )
+    with track_col_limit:
+        tracking_product_limit = st.number_input(
+            "Kontrol edilecek ürün",
+            min_value=1,
+            max_value=10000,
+            value=300,
+            step=100,
+            key="stock_tracking_product_limit",
+        )
+
+    tracking_category_options = brand_stock_category_options(tracking_selected_brands)
+    tracking_category_ids = st.multiselect(
+        "Kategori (opsiyonel)",
+        options=list(tracking_category_options.keys()),
+        format_func=lambda category_id: tracking_category_options.get(str(category_id), str(category_id)),
+        help="Boş bırakırsan seçili markanın tüm ürünlerini tarar.",
+        key="stock_tracking_category_ids",
+    )
+    seller_filter_col, own_seller_col = st.columns([1, 1])
+    with seller_filter_col:
+        tracking_seller_filter = st.text_input(
+            "Satıcı filtresi",
+            placeholder="Örn: English Home, Karaca",
+            key="stock_tracking_seller_filter",
+        )
+    with own_seller_col:
+        tracking_own_seller_only = st.checkbox(
+            "Sadece markanın kendi satıcısı",
+            value=True,
+            help="Açıkken ürünün marka adı satıcı adında geçmiyorsa o satıcının stoku dikkate alınmaz.",
+            key="stock_tracking_own_seller_only",
+        )
+
+    if st.button("Verileri çek ve stok takibine kaydet", type="primary", use_container_width=True):
+        try:
+            selected_tracking_brand_names = [
+                brand.strip() for brand in tracking_selected_brands if brand.strip()
+            ]
+            if not selected_tracking_brand_names:
+                raise ValueError("Önce en az bir marka seç.")
+            with st.status("Stok takibi için ürünler çekiliyor...", expanded=True) as status:
+                products = discover_brand_stock_candidates(
+                    selected_tracking_brand_names,
+                    tracking_category_ids,
+                    tracking_product_limit,
+                )
+                if not products:
+                    raise RuntimeError("Seçili marka için ürün linki çıkarılamadı.")
+                st.write(f"{len(products)} ürün bulundu. Stoklar kontrol ediliyor...")
+                progress = st.progress(0, text="Stoklar kontrol ediliyor")
+                live_container = st.empty()
+                checked_rows, error_rows, stats, _ = find_brand_stock_products_parallel(
+                    products,
+                    tracking_seller_filter,
+                    selected_tracking_brand_names,
+                    "",
+                    tracking_max_stock,
+                    progress,
+                    live_container,
+                    existing_checked=[],
+                    start_index=0,
+                    batch_size=len(products),
+                    workers=BRAND_STOCK_WORKERS,
+                    own_brand_seller_only=tracking_own_seller_only,
+                )
+                summary_df = product_summary_rows(pd.DataFrame(checked_rows))
+                saved_count, snapshot_at = save_stock_tracking_snapshot(
+                    summary_df.to_dict("records"),
+                    source="Stok takibi",
+                )
+                st.session_state["stock_tracking_last_result"] = {
+                    "products": products,
+                    "checked": checked_rows,
+                    "errors": error_rows,
+                    "stats": stats,
+                    "summary": summary_df.to_dict("records"),
+                    "saved_count": saved_count,
+                    "snapshot_at": snapshot_at,
+                }
+                status.update(
+                    label=f"Tamamlandı: {saved_count} ürün kaydedildi.",
+                    state="complete",
+                )
+            st.success(f"{saved_count} ürün stok takip veritabanına kaydedildi. Kayıt zamanı: {snapshot_at}")
+        except Exception as exc:
+            st.error(str(exc))
+
+    last_tracking_result = st.session_state.get("stock_tracking_last_result") or {}
+    last_summary_df = pd.DataFrame(last_tracking_result.get("summary", []))
+    if not last_summary_df.empty:
+        st.markdown("#### Son çekilen sonuç")
+        st.dataframe(
+            display_product_links(last_summary_df),
+            use_container_width=True,
+            hide_index=True,
+            column_config=product_link_column_config(),
+        )
+
+    st.markdown("#### Stok kayıtları")
+    snapshot_limit = st.number_input(
+        "Gösterilecek stok kaydı",
+        min_value=100,
+        max_value=100000,
+        value=10000,
+        step=1000,
+        help="Kayıtlar veritabanından silinmez; bu alan sadece ekranda kaç geçmiş kayıt gösterileceğini belirler.",
+        key="stock_tracking_snapshot_limit",
+    )
+    snapshot_rows_df = pd.DataFrame(stock_tracking_snapshot_rows(snapshot_limit))
+    if snapshot_rows_df.empty:
+        st.info("Henüz stok geçmişi kaydı yok.")
+    else:
+        default_snapshot_columns = [
+            "Kayıt zamanı",
+            "Ürün ID",
+            "Ürün",
+            "Marka",
+            "Kategori",
+            "En yüksek stok satıcısı",
+            "En yüksek stok",
+            "Toplam stok",
+            "Günlük satış",
+            "3 günlük satış",
+            "Satıcı stokları",
+        ]
+        grouped_snapshot_df = snapshot_rows_df.copy()
+        grouped_snapshot_df["Marka"] = grouped_snapshot_df["Marka"].fillna("Markasız").astype(str)
+        brand_names = sorted(grouped_snapshot_df["Marka"].unique(), key=str.casefold)
+        for brand_name in brand_names:
+            brand_df = grouped_snapshot_df[grouped_snapshot_df["Marka"] == brand_name].copy()
+            latest_snapshot = brand_df["Kayıt zamanı"].max() if "Kayıt zamanı" in brand_df.columns else "-"
+            safe_brand_key = re.sub(r"[^a-zA-Z0-9_]+", "_", brand_name).strip("_").lower() or "brand"
+            with st.expander(
+                f"{brand_name} ({len(brand_df)} kayıt, son: {latest_snapshot})",
+                expanded=False,
+            ):
+                filtered_brand_snapshot_df = configurable_table(
+                    brand_df,
+                    f"stock_tracking_snapshots_{safe_brand_key}",
+                    default_snapshot_columns,
+                    use_expander=False,
+                )
+                st.dataframe(
+                    display_product_links(filtered_brand_snapshot_df),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config=product_link_column_config(),
+                )
+        st.download_button(
+            "Stok geçmişini Excel indir",
+            data=excel_download(
+                {
+                    "Tüm stok geçmişi": snapshot_rows_df,
+                    **{
+                        brand_name: grouped_snapshot_df[grouped_snapshot_df["Marka"] == brand_name]
+                        for brand_name in brand_names
+                    },
+                }
+            ),
+            file_name="trendyol_stok_takibi.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 if selected_main_tab == "Favoriler":
     st.subheader("Favoriler")
@@ -3969,6 +5602,65 @@ if selected_main_tab == "Favoriler":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
+
+if selected_main_tab == "Ayarlar":
+    st.subheader("Ayarlar")
+    st.caption("Hesap/cookie bilgilerini koda yazmadan burada kaydedebilirsin.")
+
+    saved_cookie = get_nekadarsatti_cookie()
+    saved_limit = get_nekadarsatti_query_limit()
+    st.markdown("#### Nekadarsatti")
+    st.info(
+        "Cookie burada kaydedilirse Nekadarsatti sorguları bu oturumu kullanır. "
+        "Cookie süresi dolarsa yeni cookie ile güncellemen yeterli."
+    )
+    st.caption(f"Cookie durumu: {'Kayıtlı' if saved_cookie else 'Kayıtlı değil'}")
+
+    with st.form("nekadarsatti_settings_form"):
+        new_cookie = st.text_input(
+            "Nekadarsatti Cookie",
+            value="",
+            placeholder="__Secure-trendyol-tool.session_token=...",
+            type="password",
+            help="Boş bırakırsan mevcut kayıt korunur. Yeni cookie yapıştırırsan mevcut değer güncellenir.",
+        )
+        query_limit = st.number_input(
+            "Sorgu limiti",
+            min_value=1,
+            max_value=100000,
+            value=int(saved_limit),
+            step=100,
+        )
+        settings_col_a, settings_col_b = st.columns([1, 1])
+        with settings_col_a:
+            save_settings = st.form_submit_button("Ayarları kaydet", type="primary", use_container_width=True)
+        with settings_col_b:
+            clear_cookie = st.form_submit_button("Cookie sil", use_container_width=True)
+
+    if save_settings:
+        if new_cookie.strip():
+            save_app_setting("NEKADARSATTI_COOKIE", new_cookie.strip())
+        save_app_setting("NEKADARSATTI_QUERY_LIMIT", str(int(query_limit)))
+        st.success("Nekadarsatti ayarları kaydedildi.")
+        time.sleep(0.2)
+        st.rerun()
+
+    if clear_cookie:
+        save_app_setting("NEKADARSATTI_COOKIE", "")
+        st.success("Nekadarsatti cookie silindi.")
+        time.sleep(0.2)
+        st.rerun()
+
+    if st.button("Nekadarsatti bağlantısını test et", use_container_width=True):
+        try:
+            rows = fetch_nekadarsatti_category_products("34", "Saat")
+            if rows:
+                st.success(f"Bağlantı çalışıyor. Saat kategorisinden {len(rows)} ürün verisi geldi.")
+                st.dataframe(pd.DataFrame(rows[:5]), use_container_width=True, hide_index=True)
+            else:
+                st.warning("Bağlantı cevap verdi ama ürün listesi boş geldi.")
+        except Exception as exc:
+            st.error(f"Nekadarsatti bağlantı testi başarısız: {exc}")
 
 if selected_main_tab == "Kâr hesabı":
     st.subheader("Kâr hesabı")

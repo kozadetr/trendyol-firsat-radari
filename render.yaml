@@ -8,3 +8,9 @@ services:
     envVars:
       - key: APP_PASSWORD
         sync: false
+      - key: NEKADARSATTI_API_KEY
+        sync: false
+      - key: NEKADARSATTI_COOKIE
+        sync: false
+      - key: NEKADARSATTI_QUERY_LIMIT
+        value: "10000"

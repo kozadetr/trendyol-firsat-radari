@@ -47,8 +47,27 @@ streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headl
 ```
 
 6. Environment bölümüne `APP_PASSWORD` ekle.
+7. Nekadarsatti ücretli üyelik entegrasyonu için gerekirse şu değişkenleri ekle:
+
+```text
+NEKADARSATTI_API_KEY=varsa-uyelik-api-key
+NEKADARSATTI_COOKIE=nekadarsatti-oturum-cookie-degeri
+NEKADARSATTI_QUERY_LIMIT=10000
+```
+
+`NEKADARSATTI_COOKIE` eklenirse uygulama Nekadarsatti isteklerinde bu oturumu kullanmaya hazırdır. API/cookie bilgisini yalnız Render Environment alanına koy; koda yazma.
 
 Domain bağlamak için Render servisindeki `Settings > Custom Domains` alanına domaini ekleyip verdiği DNS kaydını domain paneline gir.
+
+## Nekadarsatti hazırlığı
+
+Uygulama Nekadarsatti bağlantısını tek yerden yönetir. Ücretli üyelik sonrası:
+
+- Ürün linki bazlı satış sorgusunda `NEKADARSATTI_API_KEY` veya `NEKADARSATTI_COOKIE` kullanılabilir.
+- Kategori çok satanlar araştırmasında aynı oturum bilgisi istek başlıklarına eklenir.
+- `NEKADARSATTI_QUERY_LIMIT` ile seçilebilir sorgu üst sınırı artırılabilir.
+
+Bu hazırlık güvenli taraftadır: üyelik bilgisi kodda tutulmaz, sadece environment değişkeninden okunur.
 
 ## Satış verisi kaynakları
 
@@ -70,7 +89,7 @@ ve
  veya çok satan sıra <= 20)
 ```
 
-Otomatik mod şu an en fazla 30 sorgu seçtirir ve sorgular arasına bekleme koyar. Limit dolarsa hata tablosunda görünür.
+Otomatik modun sorgu üst sınırı `NEKADARSATTI_QUERY_LIMIT` ile yönetilir. Üyelik/cookie yoksa varsayılan deneme limiti 30, üyelik oturumu tanımlanırsa varsayılan 10000 olur.
 
 Kategori seçiminden sonra ilgili kategori için önerilen markalar marka filtresinde görünür. Ek markaları virgülle yazabilirsin.
 
