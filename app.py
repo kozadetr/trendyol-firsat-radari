@@ -5662,14 +5662,22 @@ if selected_main_tab == "Ayarlar":
 
     if st.button("Nekadarsatti bağlantısını test et", use_container_width=True):
         try:
-            rows = fetch_nekadarsatti_category_products("34", "Saat")
-            if rows:
-                st.success(f"Bağlantı çalışıyor. Saat kategorisinden {len(rows)} ürün verisi geldi.")
-                st.dataframe(pd.DataFrame(rows[:5]), use_container_width=True, hide_index=True)
-            else:
-                st.warning("Bağlantı cevap verdi ama ürün listesi boş geldi.")
+            sample_product = {
+                "Ürün ID": "349342125",
+                "Ürün": "Guess GUGW0468L1 Kadın Kol Saati",
+                "Link": "https://www.trendyol.com/guess/gugw0468l1-kadin-kol-saati-p-349342125",
+            }
+            row = fetch_nekadarsatti_sales(sample_product)
+            st.success(
+                "Nekadarsatti ürün sorgusu çalışıyor. "
+                f"Örnek ürün için 3 günlük satış: {row.get('3 günlük satış')}"
+            )
+            st.dataframe(pd.DataFrame([row]), use_container_width=True, hide_index=True)
         except Exception as exc:
-            st.error(f"Nekadarsatti bağlantı testi başarısız: {exc}")
+            st.error(
+                "Nekadarsatti ürün sorgusu başarısız. Cookie süresi dolmuş olabilir veya "
+                f"Nekadarsatti bu ağı reddediyor olabilir: {exc}"
+            )
 
 if selected_main_tab == "Kâr hesabı":
     st.subheader("Kâr hesabı")
