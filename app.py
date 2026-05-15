@@ -59,7 +59,6 @@ AUTH_QUERY_PARAM = "kozade_auth"
 RUNTIME_DIR = Path(__file__).parent / ".runtime"
 BRAND_STOCK_STATE_PATH = RUNTIME_DIR / "brand_stock_result.json"
 FAVORITES_DB_PATH = RUNTIME_DIR / "favorites.db"
-FAVORITES_DATABASE_URL = os.getenv("FAVORITES_DATABASE_URL") or os.getenv("DATABASE_URL")
 STOCK_TRACKING_INITIAL_BRANDS = ["Madame Coco", "English Home", "Karaca", "Karaca Home"]
 
 LISTING_SORT_OPTIONS = {
@@ -485,6 +484,10 @@ st.set_page_config(
     page_icon=None,
     layout="wide",
 )
+
+if any(os.getenv(key) for key in ["RENDER", "RENDER_SERVICE_ID", "RENDER_EXTERNAL_HOSTNAME"]):
+    st.error("Bu uygulama yalnizca lokal kullanim icin kapatildi.")
+    st.stop()
 
 
 def require_password():
@@ -3237,20 +3240,6 @@ CREATE TABLE IF NOT EXISTS app_settings (
 
 
 def favorites_connection():
-    if FAVORITES_DATABASE_URL:
-        import psycopg2
-
-        connection = psycopg2.connect(FAVORITES_DATABASE_URL)
-        with connection.cursor() as cursor:
-            cursor.execute(FAVORITES_TABLE_SQL)
-            cursor.execute(STOCK_TRACKING_BRANDS_TABLE_SQL)
-            cursor.execute(STOCK_TRACKING_SNAPSHOTS_TABLE_SQL)
-            cursor.execute(ENGLISH_HOME_ITEMS_TABLE_SQL)
-            cursor.execute(NKS_STOCK_ITEMS_TABLE_SQL)
-            cursor.execute(APP_SETTINGS_TABLE_SQL)
-        connection.commit()
-        return connection
-
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(FAVORITES_DB_PATH, timeout=30)
     connection.execute("PRAGMA journal_mode=WAL")
@@ -3264,7 +3253,7 @@ def favorites_connection():
 
 
 def favorites_uses_postgres(connection):
-    return connection.__class__.__module__.startswith("psycopg")
+    return False
 
 
 def app_setting(key, default=None):
