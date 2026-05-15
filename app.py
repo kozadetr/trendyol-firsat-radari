@@ -27,6 +27,9 @@ USER_AGENT = (
     "Chrome/124.0 Safari/537.36"
 )
 ENVoy_MARKERS = [
+    'window["__envoy__SHARED_PROPS"]',
+    "window['__envoy__SHARED_PROPS']",
+    "__envoy__SHARED_PROPS",
     'window["__envoy_product-info__PROPS"]',
     "window['__envoy_product-info__PROPS']",
     "__envoy_product-info__PROPS",
@@ -989,12 +992,51 @@ def safe_int(value):
     return int(numeric)
 
 
+def first_safe_int(*values):
+    for value in values:
+        parsed = safe_int(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def best_number_match(patterns, text):
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
             return parse_compact_number(match.group(1))
     return None
+
+
+class NekadarsattiQuotaError(RuntimeError):
+    def __init__(self, message, wait_seconds):
+        super().__init__(message)
+        self.wait_seconds = max(60, int(wait_seconds or 600))
+
+
+def nekadarsatti_quota_wait_seconds(message):
+    text = clean_text(message) or ""
+    normalized = text.casefold()
+    if "sorgu hakk" not in normalized and "limit" not in normalized and "quota" not in normalized:
+        return None
+
+    match = re.search(r"\b(\d{1,2}):(\d{2})\b", text)
+    if not match:
+        return 10 * 60
+
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    now = datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target = target.replace(day=target.day) + pd.Timedelta(days=1)
+    return int((target - now).total_seconds()) + 60
+
+
+def raise_if_nekadarsatti_quota(message):
+    wait_seconds = nekadarsatti_quota_wait_seconds(message)
+    if wait_seconds is not None:
+        raise NekadarsattiQuotaError(clean_text(message) or "Nekadarsatti sorgu hakkı doldu.", wait_seconds)
 
 
 def with_category_query(category_url, page_no, sort_value="BEST_SELLER"):
@@ -1569,6 +1611,31 @@ def stock_status(in_stock, quantity):
     return "Bilinmiyor"
 
 
+def numeric_stock_value(value):
+    if isinstance(value, dict):
+        for key in ("quantity", "stock", "availableQuantity", "availableStock", "stockQuantity", "stockCount", "value"):
+            stock = numeric_stock_value(value.get(key))
+            if stock is not None:
+                return stock
+        return None
+    if isinstance(value, bool) or value in [None, ""]:
+        return None
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return None
+    return int(numeric)
+
+
+def variant_quantity(variant):
+    if not isinstance(variant, dict):
+        return None
+    for key in ("quantity", "stock", "availableQuantity", "availableStock", "stockQuantity", "stockCount"):
+        stock = numeric_stock_value(variant.get(key))
+        if stock is not None:
+            return stock
+    return None
+
+
 def product_summary(props):
     product = props.get("product", {})
     brand = product.get("brand") if isinstance(product.get("brand"), dict) else {}
@@ -1691,6 +1758,8 @@ def seller_rows(props):
     winner_variant = listing.get("winnerVariant")
     main_merchant = listing.get("merchant", {})
     append_variant_row(main_merchant, winner_variant, "Seçili satıcı", listing.get("price"))
+    for variant in listing.get("variants", []):
+        append_variant_row(main_merchant, variant, "Seçili satıcı", listing.get("price"))
 
     for merchant in listing.get("otherMerchants", []):
         if not isinstance(merchant, dict):
@@ -1720,6 +1789,9 @@ def seller_rows(props):
 
     walk_listing_tree(product)
 
+    if not any(numeric_stock_value(row.get("Quantity")) is not None for row in rows):
+        rows.extend(fallback_stock_rows(product))
+
     seen = set()
     unique_rows = []
     for row in rows:
@@ -1733,7 +1805,7 @@ def seller_rows(props):
 
 
 def make_row(merchant, variant, source, fallback_price):
-    quantity = variant.get("quantity")
+    quantity = variant_quantity(variant)
 
     return {
         "Satıcı": merchant.get("name") or "Bilinmeyen satıcı",
@@ -1746,6 +1818,69 @@ def make_row(merchant, variant, source, fallback_price):
         "Listing ID": variant.get("listingId"),
         "Kaynak": source,
     }
+
+
+def fallback_stock_rows(product):
+    rows = []
+
+    def merchant_from_node(node, current_merchant, key_name):
+        if not isinstance(node, dict):
+            return current_merchant
+        key_text = str(key_name or "").casefold()
+        if any(token in key_text for token in ("merchant", "seller", "supplier")):
+            name = node.get("name") or node.get("sellerName") or node.get("merchantName")
+            if name or node.get("id") or node.get("sellerId") or node.get("merchantId"):
+                return {
+                    "name": name or current_merchant.get("name") or "Bilinmeyen satıcı",
+                    "id": node.get("id") or node.get("sellerId") or node.get("merchantId"),
+                }
+        return current_merchant
+
+    def looks_like_stock_node(node):
+        if not isinstance(node, dict):
+            return False
+        stock = variant_quantity(node)
+        if stock is None:
+            return False
+        context_keys = {
+            "quantity",
+            "inStock",
+            "listingId",
+            "stockId",
+            "availableQuantity",
+            "availableStock",
+            "stockQuantity",
+            "stockCount",
+            "maxSaleLimit",
+            "barcode",
+            "merchantId",
+            "sellerId",
+        }
+        return bool(context_keys.intersection(node.keys()))
+
+    def walk(node, current_merchant=None, key_name=None):
+        current_merchant = current_merchant or {}
+        if isinstance(node, dict):
+            merchant = merchant_from_node(node, current_merchant, key_name)
+            if looks_like_stock_node(node):
+                rows.append(make_row(merchant, node, "Stok alanı", node.get("price")))
+            for child_key, value in node.items():
+                walk(value, merchant, child_key)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, current_merchant, key_name)
+
+    walk(product)
+
+    seen = set()
+    unique_rows = []
+    for row in rows:
+        signature = (row["Satıcı ID"], row["Listing ID"], row["Quantity"], row["Varyant"])
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique_rows.append(row)
+    return unique_rows
 
 
 def raw_quantity_matches(source_text):
@@ -1772,13 +1907,14 @@ def analyze_source(source_text):
     summary = product_summary(props)
     rows = seller_rows(props)
     raw_rows = raw_quantity_matches(source_text)
+    has_numeric_stock = any(numeric_stock_value(row.get("Quantity")) is not None for row in rows)
 
     stock_like_raw_rows = [
         row
         for row in raw_rows
         if any(token in str(row.get("Bağlam") or "") for token in ("variants", "inStock", "listingId"))
     ]
-    if not rows and stock_like_raw_rows:
+    if not has_numeric_stock and stock_like_raw_rows:
         best_raw_row = max(stock_like_raw_rows, key=lambda row: row["Quantity"])
         rows = [
             {
@@ -1898,10 +2034,15 @@ def parse_nekadarsatti_response(product, response_text):
     try:
         payload = json.loads(response_text)
     except json.JSONDecodeError as exc:
+        raise_if_nekadarsatti_quota(response_text)
         raise ValueError("Nekadarsatti JSON olmayan cevap döndürdü.") from exc
 
     if not isinstance(payload, dict):
         raise ValueError("Nekadarsatti cevabı beklenen formatta değil.")
+
+    quota_message = payload.get("error") or payload.get("message") or payload.get("detail") or payload.get("text")
+    if quota_message:
+        raise_if_nekadarsatti_quota(quota_message)
 
     order = payload.get("order")
     sales_count = pd.to_numeric(order, errors="coerce")
@@ -1934,6 +2075,7 @@ def fetch_nekadarsatti_sales(product):
             message = payload.get("error") or payload.get("message") or response_text
         except json.JSONDecodeError:
             message = clean_text(response_text) or "Bilinmeyen hata"
+        raise_if_nekadarsatti_quota(message)
         raise RuntimeError(f"Nekadarsatti HTTP {status}: {message}")
 
     return parse_nekadarsatti_response(product, response_text)
@@ -1948,6 +2090,18 @@ def fetch_nekadarsatti_sales_map(products, limit, delay_seconds, status_containe
         status_container.write(f"Nekadarsatti {index}/{len(limited_products)}: {product['Ürün ID']}")
         try:
             sales_rows.append(fetch_nekadarsatti_sales(product))
+        except NekadarsattiQuotaError as exc:
+            sales_errors.append(
+                {
+                    "Ürün ID": product["Ürün ID"],
+                    "Ürün": product["Ürün"],
+                    "Hata": str(exc),
+                    "Link": product["Link"],
+                }
+            )
+            if status_container:
+                status_container.write("Nekadarsatti kotası doldu; sorgu durduruldu.")
+            break
         except Exception as exc:
             sales_errors.append(
                 {
@@ -2123,6 +2277,22 @@ def fetch_nekadarsatti_category_sales_map(category_map, selected_brands, status_
     return sales_map, sales_rows, errors
 
 
+def saved_nks_sales_map():
+    sales_map = {}
+    for row in nks_stock_saved_rows():
+        product_id = str(row.get("Ürün ID") or "").strip()
+        if not product_id:
+            continue
+        sales_map[product_id] = {
+            "3 günlük satış": safe_int(row.get("3 günlük satış")),
+            "NKS kategori": row.get("Kategori"),
+            "NKS eşleşme": "Kayıtlı",
+            "NKS kayıtlı Trendyol stoğu": safe_int(row.get("Trendyol stoğu")),
+            "NKS son güncelleme": row.get("Son güncelleme"),
+        }
+    return sales_map
+
+
 def apply_category_sales_to_rows(rows, sales_map):
     enriched_rows = []
     for row in rows:
@@ -2131,11 +2301,16 @@ def apply_category_sales_to_rows(rows, sales_map):
         enriched_rows.append(
             {
                 **row,
-                "3 günlük satış": sales.get("3 günlük satış"),
-                "3 günlük ciro": sales.get("3 günlük ciro"),
-                "NKS favori": sales.get("NKS favori"),
-                "NKS kategori": sales.get("NKS kategori"),
-                "NKS eşleşme": "Evet" if sales else "Hayır",
+                "3 günlük satış": sales.get("3 günlük satış", row.get("3 günlük satış")),
+                "3 günlük ciro": sales.get("3 günlük ciro", row.get("3 günlük ciro")),
+                "NKS favori": sales.get("NKS favori", row.get("NKS favori")),
+                "NKS kategori": sales.get("NKS kategori", row.get("NKS kategori")),
+                "NKS eşleşme": sales.get("NKS eşleşme") or ("Evet" if sales else row.get("NKS eşleşme", "Hayır")),
+                "NKS kayıtlı Trendyol stoğu": sales.get(
+                    "NKS kayıtlı Trendyol stoğu",
+                    row.get("NKS kayıtlı Trendyol stoğu"),
+                ),
+                "NKS son güncelleme": sales.get("NKS son güncelleme", row.get("NKS son güncelleme")),
             }
         )
     return enriched_rows
@@ -2613,13 +2788,13 @@ def read_product_trendyol_stock(product, selected_brands=None):
 
     seller_stock_rows = []
     for row in rows:
-        quantity = pd.to_numeric(row.get("Quantity"), errors="coerce")
-        if pd.isna(quantity):
+        quantity = numeric_stock_value(row.get("Quantity"))
+        if quantity is None:
             continue
         seller_stock_rows.append(
             {
                 "seller": row.get("Satıcı"),
-                "stock": int(quantity),
+                "stock": quantity,
             }
         )
     top_stock_record = max(seller_stock_rows, key=lambda item: item["stock"]) if seller_stock_rows else None
@@ -2662,6 +2837,18 @@ def nks_stock_rows(products, selected_brands=None, status_container=None, delay_
                 }
             )
             row["3 günlük satış"] = sales_row.get("3 günlük satış")
+        except NekadarsattiQuotaError as exc:
+            errors.append(
+                {
+                    "Ürün ID": row["Ürün ID"],
+                    "Ürün": row["Ürün adı"],
+                    "Hata": str(exc),
+                    "Link": row["Trendyol linki"],
+                }
+            )
+            if status_container:
+                status_container.write("Nekadarsatti kotası doldu; sorgu durduruldu.")
+            break
         except Exception as exc:
             errors.append(
                 {
@@ -2683,8 +2870,9 @@ def nks_stock_rows(products, selected_brands=None, status_container=None, delay_
 def render_nks_live_rows(rows, live_container):
     if not live_container or not rows:
         return
+    display_df = pd.DataFrame(rows)[["Ürün adı", "Trendyol linki", "Trendyol stoğu", "3 günlük satış"]].copy()
     live_container.dataframe(
-        pd.DataFrame(rows)[["Ürün adı", "Trendyol linki", "Trendyol stoğu", "3 günlük satış"]],
+        display_df[["Ürün adı", "Trendyol linki", "Trendyol stoğu", "3 günlük satış"]],
         use_container_width=True,
         hide_index=True,
         column_config={
@@ -2788,6 +2976,18 @@ def nks_stock_rows_stream(brand_name, category_ids, product_limit, saved_ids=Non
                 }
             )
             row["3 günlük satış"] = sales_row.get("3 günlük satış")
+        except NekadarsattiQuotaError as exc:
+            errors.append(
+                {
+                    "Ürün ID": row["Ürün ID"],
+                    "Ürün": row["Ürün adı"],
+                    "Hata": str(exc),
+                    "Link": row["Trendyol linki"],
+                }
+            )
+            if status_container:
+                status_container.write("Nekadarsatti kotası doldu; sorgu durduruldu.")
+            break
         except Exception as exc:
             errors.append(
                 {
@@ -3153,12 +3353,14 @@ def nks_stock_saved_rows():
     return output
 
 
-def nks_saved_product_ids(brand_name=None):
+def nks_saved_product_ids(brand_name=None, skip_missing_stock=True):
     rows = nks_stock_saved_rows()
     target_brand = str(brand_name or "").casefold()
     saved_ids = set()
     for row in rows:
         if target_brand and str(row.get("Marka") or "").casefold() != target_brand:
+            continue
+        if skip_missing_stock and safe_int(row.get("Trendyol stoğu")) is None:
             continue
         product_id = str(row.get("Ürün ID") or "").strip()
         if product_id:
@@ -3889,7 +4091,19 @@ def add_favorite_rows(rows):
         cursor = connection.cursor() if use_postgres else None
         for row in rows:
             record = json_safe(dict(row))
+            if not record.get("Ürün") and record.get("Ürün adı"):
+                record["Ürün"] = record.get("Ürün adı")
+            if not record.get("Link"):
+                record["Link"] = (
+                    record.get("Trendyol linki")
+                    or record.get("Ürün linki")
+                    or record.get("Trendyol link")
+                )
             product_id = str(record.get("Ürün ID") or "").strip()
+            if not product_id:
+                product_id = extract_product_id(record.get("Link"))
+                if product_id:
+                    record["Ürün ID"] = product_id
             if not product_id:
                 continue
             params = (
@@ -3971,6 +4185,32 @@ def merge_stats(base, addition):
     return merged
 
 
+def result_dataframes(result, cache_prefix):
+    checked = result.get("checked", [])
+    errors = result.get("errors", [])
+    cache_key = (
+        result.get("checked_at"),
+        len(checked),
+        len(errors),
+        result.get("next_index"),
+        result.get("complete"),
+    )
+    session_key = f"{cache_prefix}_dataframes"
+    cached = st.session_state.get(session_key)
+    if cached and cached.get("key") == cache_key:
+        return cached["checked_df"], cached["errors_df"]
+
+    checked_df = pd.DataFrame(checked)
+    errors_df = pd.DataFrame(errors)
+    st.session_state[session_key] = {
+        "key": cache_key,
+        "checked_df": checked_df,
+        "errors_df": errors_df,
+    }
+    return checked_df, errors_df
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
 def product_summary_rows(checked_df, include_signal_columns=True, sort_rows=True):
     if checked_df.empty or "Ürün ID" not in checked_df.columns:
         return pd.DataFrame()
@@ -4008,7 +4248,9 @@ def product_summary_rows(checked_df, include_signal_columns=True, sort_rows=True
             "Liste etiketi": first_present(group.get("Liste etiketi", pd.Series(dtype=object))),
             "En yüksek stok satıcısı": top_seller,
             "En yüksek stok": top_stock,
+            "Trendyol stoğu": top_stock,
             "Toplam stok": total_stock,
+            "Toplam Trendyol stoğu": total_stock,
             "Max stok satıcısı": first_present(group.get("Max stok satıcısı", pd.Series(dtype=object))) or top_seller,
             "Diğer stoklar": other_stocks,
             "Satıcı stokları": seller_stock_text,
@@ -4017,11 +4259,14 @@ def product_summary_rows(checked_df, include_signal_columns=True, sort_rows=True
             "NKS favori": first_present(group.get("NKS favori", pd.Series(dtype=object))),
             "NKS kategori": first_present(group.get("NKS kategori", pd.Series(dtype=object))),
             "NKS eşleşme": first_present(group.get("NKS eşleşme", pd.Series(dtype=object))),
+            "NKS kayıtlı Trendyol stoğu": first_present(group.get("NKS kayıtlı Trendyol stoğu", pd.Series(dtype=object))),
+            "NKS son güncelleme": first_present(group.get("NKS son güncelleme", pd.Series(dtype=object))),
             "Favori": first_present(group.get("Favori", pd.Series(dtype=object))),
             "Yorum": first_present(group.get("Yorum", pd.Series(dtype=object))),
             "Değerlendirme": first_present(group.get("Değerlendirme", pd.Series(dtype=object))),
             "Fırsat satırı var": "Evet" if (group.get("Fırsat", pd.Series(dtype=object)) == "Evet").any() else "Hayır",
             "Link": first_present(group.get("Link", pd.Series(dtype=object))),
+            "Trendyol linki": first_present(group.get("Link", pd.Series(dtype=object))),
         }
         if include_signal_columns:
             summary_row.update(
@@ -4048,25 +4293,25 @@ def display_product_links(df):
 
     display_df = df.copy()
     display_df["Ürün"] = display_df["Ürün"].astype(str)
-    display_df["Ürün linki"] = display_df["Link"]
+    display_df["Trendyol linki"] = display_df["Link"]
     preferred_columns = []
     for column in display_df.columns:
         if column == "Link":
             continue
         if column == "Ürün":
             preferred_columns.append(column)
-            preferred_columns.append("Ürün linki")
+            preferred_columns.append("Trendyol linki")
             continue
-        if column != "Ürün linki":
+        if column != "Trendyol linki":
             preferred_columns.append(column)
     return display_df[preferred_columns]
 
 
 def product_link_column_config():
     return {
-        "Ürün linki": st.column_config.LinkColumn(
-            "Aç",
-            display_text="Trendyol",
+        "Trendyol linki": st.column_config.LinkColumn(
+            "Trendyol linki",
+            display_text="Aç",
         )
     }
 
@@ -4082,6 +4327,14 @@ def favorite_editor(df, key):
     display_df = display_product_links(df)
     if display_df.empty:
         return display_df
+
+    favorite_editor_limit = 300
+    if len(display_df) > favorite_editor_limit:
+        st.caption(
+            f"Favori seçimi hız için ilk {favorite_editor_limit} satırla sınırlandı. "
+            "Daha fazlası için tablo filtresini daralt."
+        )
+        display_df = display_df.head(favorite_editor_limit).copy()
 
     editor_df = display_df.copy()
     if "Favori" in editor_df.columns:
@@ -4100,6 +4353,436 @@ def favorite_editor(df, key):
         column_config=column_config,
         key=key,
     )
+
+
+def nks_rows_to_favorites(df):
+    if df.empty:
+        return df
+
+    favorite_df = df.copy()
+    if "Ürün" not in favorite_df.columns:
+        favorite_df["Ürün"] = favorite_df.get("Ürün adı")
+    if "Link" not in favorite_df.columns:
+        favorite_df["Link"] = favorite_df.get("Trendyol linki")
+    if "Stok" not in favorite_df.columns:
+        favorite_df["Stok"] = favorite_df.get("Trendyol stoğu")
+    if "Toplam stok" not in favorite_df.columns:
+        favorite_df["Toplam stok"] = favorite_df.get("Toplam Trendyol stoğu")
+    return favorite_df
+
+
+def selected_favorite_rows(source_df, editor_df, transform_rows=None):
+    if editor_df.empty or "Favoriye ekle" not in editor_df.columns:
+        return pd.DataFrame()
+
+    selected_editor_rows = editor_df[editor_df["Favoriye ekle"]].copy()
+    if selected_editor_rows.empty:
+        return pd.DataFrame()
+
+    link_columns = ["Link", "Trendyol linki", "Ürün linki", "Trendyol link"]
+    if "Ürün ID" not in selected_editor_rows.columns:
+        selected_editor_rows["Ürün ID"] = ""
+    for column in link_columns:
+        if column in selected_editor_rows.columns:
+            missing_id_mask = selected_editor_rows["Ürün ID"].astype(str).str.strip().eq("")
+            if missing_id_mask.any():
+                selected_editor_rows.loc[missing_id_mask, "Ürün ID"] = selected_editor_rows.loc[
+                    missing_id_mask, column
+                ].map(extract_product_id)
+
+    selected_ids = {
+        str(product_id).strip()
+        for product_id in selected_editor_rows["Ürün ID"].tolist()
+        if str(product_id).strip()
+    }
+    selected_links = {
+        str(link).strip()
+        for column in link_columns
+        if column in selected_editor_rows.columns
+        for link in selected_editor_rows[column].tolist()
+        if str(link).strip()
+    }
+    favorite_rows_to_add = transform_rows(source_df) if transform_rows else source_df.copy()
+    if "Ürün ID" in favorite_rows_to_add.columns and selected_ids:
+        favorite_rows_to_add = favorite_rows_to_add[
+            favorite_rows_to_add["Ürün ID"].astype(str).isin(selected_ids)
+        ]
+    elif selected_links and any(column in favorite_rows_to_add.columns for column in link_columns):
+        link_mask = pd.Series(False, index=favorite_rows_to_add.index)
+        for column in link_columns:
+            if column in favorite_rows_to_add.columns:
+                link_mask |= favorite_rows_to_add[column].astype(str).isin(selected_links)
+        favorite_rows_to_add = favorite_rows_to_add[link_mask].copy()
+    else:
+        favorite_rows_to_add = pd.DataFrame()
+
+    if len(favorite_rows_to_add) < len(selected_editor_rows):
+        selected_editor_rows = selected_editor_rows.drop(columns=["Favoriye ekle"], errors="ignore")
+        if "Favori sayısı" in selected_editor_rows.columns and "Favori" not in selected_editor_rows.columns:
+            selected_editor_rows = selected_editor_rows.rename(columns={"Favori sayısı": "Favori"})
+        selected_editor_rows = selected_editor_rows.rename(columns={"Trendyol linki": "Link"})
+        if "Ürün ID" not in selected_editor_rows.columns and "Link" in selected_editor_rows.columns:
+            selected_editor_rows["Ürün ID"] = selected_editor_rows["Link"].map(extract_product_id)
+        fallback_rows = selected_editor_rows[
+            ~selected_editor_rows["Ürün ID"].astype(str).isin(
+                favorite_rows_to_add.get("Ürün ID", pd.Series(dtype=object)).astype(str)
+            )
+        ]
+        if not fallback_rows.empty:
+            favorite_rows_to_add = pd.concat([favorite_rows_to_add, fallback_rows], ignore_index=True)
+    return favorite_rows_to_add
+
+
+def save_selected_favorites(source_df, editor_df, transform_rows=None):
+    rows_to_add = selected_favorite_rows(source_df, editor_df, transform_rows=transform_rows)
+    if rows_to_add.empty:
+        return 0
+    return add_favorite_rows(rows_to_add.to_dict("records"))
+
+
+def source_rows_for_visible_table(source_df, visible_df):
+    if source_df.empty or visible_df.empty:
+        return []
+
+    matching_indexes = source_df.index.intersection(visible_df.index)
+    if len(matching_indexes):
+        return source_df.loc[matching_indexes].to_dict("records")
+
+    if "Ürün ID" in source_df.columns and "Ürün ID" in visible_df.columns:
+        visible_ids = {
+            str(product_id).strip()
+            for product_id in visible_df["Ürün ID"].tolist()
+            if str(product_id).strip()
+        }
+        if visible_ids:
+            return source_df[source_df["Ürün ID"].astype(str).isin(visible_ids)].to_dict("records")
+
+    link_columns = ["Link", "Trendyol linki", "Ürün linki", "Trendyol link"]
+    visible_links = {
+        str(link).strip()
+        for column in link_columns
+        if column in visible_df.columns
+        for link in visible_df[column].tolist()
+        if str(link).strip()
+    }
+    if visible_links:
+        link_mask = pd.Series(False, index=source_df.index)
+        for column in link_columns:
+            if column in source_df.columns:
+                link_mask |= source_df[column].astype(str).isin(visible_links)
+        return source_df[link_mask].to_dict("records")
+
+    return visible_df.to_dict("records")
+
+
+def has_saved_value(value):
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return bool(text) and text.casefold() not in {"none", "nan", "nat", "null"}
+
+
+def clean_integer_float_text(value):
+    if not has_saved_value(value):
+        return "-"
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.notna(numeric) and float(numeric).is_integer():
+        return str(int(numeric))
+    return str(value)
+
+
+def clean_integer_float_columns(df, columns):
+    output_df = df.copy()
+    for column in columns:
+        if column in output_df.columns:
+            output_df[column] = output_df[column].map(clean_integer_float_text)
+    return output_df
+
+
+def favorite_rows_without_nks(rows):
+    nks_columns = [
+        "3 günlük satış",
+        "3 günlük ciro",
+        "NKS favori",
+    ]
+    return [
+        row
+        for row in rows
+        if not any(has_saved_value(row.get(column)) for column in nks_columns)
+    ]
+
+
+def parse_saved_datetime(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def elapsed_time_text(value):
+    updated_at = parse_saved_datetime(value)
+    if not updated_at:
+        return "-"
+    elapsed_seconds = max(0, int((datetime.now() - updated_at).total_seconds()))
+    if elapsed_seconds < 3600:
+        minutes = max(1, elapsed_seconds // 60)
+        return f"{minutes} dk önce"
+    hours = elapsed_seconds // 3600
+    if hours < 48:
+        return f"{hours} saat önce"
+    return f"{hours // 24} gün önce"
+
+
+def delta_badge_html(delta):
+    parsed_delta = safe_int(delta)
+    if parsed_delta is None or parsed_delta == 0:
+        return ""
+    color = "#16a34a" if parsed_delta > 0 else "#dc2626"
+    sign = "+" if parsed_delta > 0 else ""
+    return (
+        f'<span class="delta-badge" style="color:{color};">'
+        f"{sign}{parsed_delta}</span>"
+    )
+
+
+def value_with_delta_html(value, delta):
+    display_value = html.escape(clean_integer_float_text(value))
+    return f'<span class="metric-value">{display_value}</span>{delta_badge_html(delta)}'
+
+
+def render_favorite_change_table(df):
+    if df.empty:
+        return
+
+    table_df = df.head(300).copy()
+    rows_html = []
+    for _, row in table_df.iterrows():
+        product_name = html.escape(str(row.get("Ürün") or row.get("Ürün adı") or "-"))
+        brand = html.escape(str(row.get("Marka") or "-"))
+        trendyol_stock = value_with_delta_html(
+            row.get("Trendyol stoğu") if has_saved_value(row.get("Trendyol stoğu")) else row.get("En yüksek stok"),
+            row.get("Trendyol stoğu değişim"),
+        )
+        total_stock = value_with_delta_html(
+            row.get("Toplam stok") if has_saved_value(row.get("Toplam stok")) else row.get("Toplam Trendyol stoğu"),
+            row.get("Toplam stok değişim"),
+        )
+        nks_sales = value_with_delta_html(row.get("3 günlük satış"), row.get("NKS satış değişim"))
+        stock_elapsed = html.escape(elapsed_time_text(row.get("Trendyol stok güncellendi")))
+        nks_elapsed = html.escape(elapsed_time_text(row.get("NKS güncellendi")))
+        rows_html.append(
+            "<tr>"
+            f"<td>{product_name}<div class='subtle-text'>{brand}</div></td>"
+            f"<td>{trendyol_stock}<div class='subtle-text'>{stock_elapsed}</div></td>"
+            f"<td>{total_stock}<div class='subtle-text'>{stock_elapsed}</div></td>"
+            f"<td>{nks_sales}<div class='subtle-text'>{nks_elapsed}</div></td>"
+            "</tr>"
+        )
+
+    if len(df) > len(table_df):
+        rows_html.append(
+            "<tr><td colspan='4' class='subtle-text'>"
+            f"Hız için ilk {len(table_df)} favori gösteriliyor. Filtreleri daraltarak diğerlerini görebilirsin."
+            "</td></tr>"
+        )
+
+    st.markdown(
+        """
+        <style>
+            .favorite-change-table {
+                width: 100%;
+                border-collapse: collapse;
+                margin: 0.35rem 0 1rem 0;
+                font-size: 0.92rem;
+            }
+            .favorite-change-table th,
+            .favorite-change-table td {
+                border-bottom: 1px solid rgba(49, 51, 63, 0.16);
+                padding: 0.55rem 0.5rem;
+                vertical-align: top;
+            }
+            .favorite-change-table th {
+                text-align: left;
+                color: rgba(49, 51, 63, 0.72);
+                font-size: 0.8rem;
+                font-weight: 600;
+            }
+            .metric-value {
+                font-weight: 600;
+            }
+            .delta-badge {
+                font-size: 0.74rem;
+                font-weight: 700;
+                margin-left: 0.35rem;
+                white-space: nowrap;
+            }
+            .subtle-text {
+                color: rgba(49, 51, 63, 0.6);
+                font-size: 0.74rem;
+                line-height: 1.25;
+                margin-top: 0.15rem;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<table class='favorite-change-table'>"
+        "<thead><tr>"
+        "<th>Ürün</th>"
+        "<th>Trendyol stoğu</th>"
+        "<th>Toplam stok</th>"
+        "<th>NKS 3 günlük satış</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(rows_html)}</tbody>"
+        "</table>",
+        unsafe_allow_html=True,
+    )
+
+
+def refresh_favorite_trendyol_stocks(rows, progress=None):
+    updated_rows = []
+    errors = []
+    target_rows = list(rows)
+
+    for index, source_row in enumerate(target_rows, start=1):
+        if progress:
+            progress.progress(index / max(len(target_rows), 1), text=f"{index}/{len(target_rows)} Trendyol stok güncelleniyor")
+
+        record = dict(source_row)
+        product = {
+            "Ürün ID": record.get("Ürün ID"),
+            "Ürün": record.get("Ürün") or record.get("Ürün adı"),
+            "Link": record.get("Link") or record.get("Trendyol linki") or record.get("Ürün linki"),
+            "Marka": record.get("Marka"),
+            "Kategori": record.get("Kategori"),
+        }
+        row, error = read_product_trendyol_stock(product, None)
+        if error:
+            errors.append(error)
+            continue
+        if not row:
+            continue
+
+        old_trendyol_stock = first_safe_int(record.get("Trendyol stoğu"), record.get("En yüksek stok"))
+        old_total_stock = first_safe_int(record.get("Toplam stok"), record.get("Toplam Trendyol stoğu"))
+        new_trendyol_stock = safe_int(row.get("Trendyol stoğu"))
+        new_total_stock = safe_int(row.get("Toplam Trendyol stoğu"))
+        updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        record.update(
+            {
+                "Ürün": row.get("Ürün adı") or record.get("Ürün"),
+                "Marka": row.get("Marka") or record.get("Marka"),
+                "Kategori": row.get("Kategori") or record.get("Kategori"),
+                "Link": row.get("Trendyol linki") or record.get("Link"),
+                "En yüksek stok satıcısı": row.get("En yüksek stok satıcısı"),
+                "En yüksek stok": row.get("Trendyol stoğu"),
+                "Trendyol stoğu": row.get("Trendyol stoğu"),
+                "Toplam stok": row.get("Toplam Trendyol stoğu"),
+                "Toplam Trendyol stoğu": row.get("Toplam Trendyol stoğu"),
+                "Trendyol stoğu önceki": old_trendyol_stock,
+                "Trendyol stoğu değişim": (
+                    new_trendyol_stock - old_trendyol_stock
+                    if new_trendyol_stock is not None and old_trendyol_stock is not None
+                    else None
+                ),
+                "Toplam stok önceki": old_total_stock,
+                "Toplam stok değişim": (
+                    new_total_stock - old_total_stock
+                    if new_total_stock is not None and old_total_stock is not None
+                    else None
+                ),
+                "Trendyol stok güncellendi": updated_at,
+            }
+        )
+        updated_rows.append(record)
+
+    if progress:
+        progress.empty()
+    if updated_rows:
+        add_favorite_rows(updated_rows)
+    return updated_rows, errors
+
+
+def refresh_favorite_nks_sales(rows, progress=None):
+    updated_rows = []
+    errors = []
+    quota_stopped = False
+    target_rows = list(rows)
+
+    for index, source_row in enumerate(target_rows, start=1):
+        if progress:
+            progress.progress(index / max(len(target_rows), 1), text=f"{index}/{len(target_rows)} NKS satış güncelleniyor")
+
+        record = dict(source_row)
+        product = {
+            "Ürün ID": record.get("Ürün ID"),
+            "Ürün": record.get("Ürün") or record.get("Ürün adı"),
+            "Link": record.get("Link") or record.get("Trendyol linki") or record.get("Ürün linki"),
+        }
+        try:
+            sales_row = fetch_nekadarsatti_sales(product)
+        except NekadarsattiQuotaError as exc:
+            quota_stopped = True
+            errors.append(
+                {
+                    "Ürün ID": product.get("Ürün ID"),
+                    "Ürün": product.get("Ürün"),
+                    "Hata": str(exc),
+                    "Link": product.get("Link"),
+                }
+            )
+            break
+        except Exception as exc:
+            errors.append(
+                {
+                    "Ürün ID": product.get("Ürün ID"),
+                    "Ürün": product.get("Ürün"),
+                    "Hata": str(exc),
+                    "Link": product.get("Link"),
+                }
+            )
+            continue
+
+        old_nks_sales = safe_int(record.get("3 günlük satış"))
+        new_nks_sales = safe_int(sales_row.get("3 günlük satış"))
+        updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        record.update(
+            {
+                "Ürün": sales_row.get("Ürün") or record.get("Ürün"),
+                "Link": sales_row.get("Link") or record.get("Link"),
+                "3 günlük satış": sales_row.get("3 günlük satış"),
+                "3 günlük ciro": sales_row.get("Ciro"),
+                "NKS favori": sales_row.get("Favori"),
+                "NKS satış önceki": old_nks_sales,
+                "NKS satış değişim": (
+                    new_nks_sales - old_nks_sales
+                    if new_nks_sales is not None and old_nks_sales is not None
+                    else None
+                ),
+                "NKS güncellendi": updated_at,
+            }
+        )
+        updated_rows.append(record)
+
+    if progress:
+        progress.empty()
+    if updated_rows:
+        add_favorite_rows(updated_rows)
+    return updated_rows, errors, quota_stopped
 
 
 def vat_portion(gross_amount, vat_rate):
@@ -4206,7 +4889,7 @@ def configurable_table(df, key_prefix, default_columns=None, use_expander=True):
 
     controls_area = st.expander("Tablo filtreleri ve kolonlar", expanded=True) if use_expander else st.container()
     with controls_area:
-        search_col, numeric_col, sort_col = st.columns([1.2, 1, 1])
+        search_col, numeric_col, sort_col, limit_col = st.columns([1.2, 1, 1, 0.8])
 
         with search_col:
             search_text = st.text_input(
@@ -4215,10 +4898,11 @@ def configurable_table(df, key_prefix, default_columns=None, use_expander=True):
                 key=f"{key_prefix}_search",
             )
 
+        numeric_probe_df = filtered_df.head(1000)
         numeric_columns = [
             column
             for column in available_columns
-            if pd.to_numeric(filtered_df[column], errors="coerce").notna().any()
+            if pd.to_numeric(numeric_probe_df[column], errors="coerce").notna().any()
         ]
         with numeric_col:
             selected_numeric_column = st.selectbox(
@@ -4234,9 +4918,25 @@ def configurable_table(df, key_prefix, default_columns=None, use_expander=True):
                 key=f"{key_prefix}_sort_column",
             )
 
+        with limit_col:
+            display_limit = st.number_input(
+                "Satır",
+                min_value=50,
+                max_value=5000,
+                value=300,
+                step=50,
+                key=f"{key_prefix}_display_limit",
+                help="Ekranda gösterilecek maksimum satır. Filtreleri hızlı tutmak için düşük bırak.",
+            )
+
         if search_text.strip():
             search_pattern = re.escape(search_text.strip())
-            search_mask = filtered_df.astype(str).apply(
+            preferred_search_columns = [
+                column
+                for column in ["Ürün ID", "Ürün", "Marka", "Kategori", "Satıcı", "Varyant", "Link", "Trendyol linki"]
+                if column in filtered_df.columns
+            ] or visible_options
+            search_mask = filtered_df[preferred_search_columns].astype(str).apply(
                 lambda column: column.str.contains(search_pattern, case=False, na=False),
                 axis=0,
             ).any(axis=1)
@@ -4296,7 +4996,11 @@ def configurable_table(df, key_prefix, default_columns=None, use_expander=True):
     output_columns = [column for column in selected_columns if column in filtered_df.columns]
     if "Ürün" in output_columns and "Link" in filtered_df.columns:
         output_columns.append("Link")
-    return filtered_df[output_columns]
+    output_df = filtered_df[output_columns]
+    if len(output_df) > int(display_limit):
+        st.caption(f"{len(output_df)} satır filtrelendi; hız için ilk {int(display_limit)} satır gösteriliyor.")
+        output_df = output_df.head(int(display_limit))
+    return output_df
 
 
 st.title("Trendyol Fırsat Radarı")
@@ -4577,12 +5281,23 @@ if selected_main_tab == "Fırsat radarı":
             if opportunities_df.empty:
                 st.info("Bu kriterlerle fırsat ürünü bulunamadı.")
             else:
-                st.dataframe(
-                    display_product_links(opportunities_df),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config=product_link_column_config(),
+                opportunity_favorite_editor = favorite_editor(
+                    opportunities_df,
+                    "radar_opportunities_favorite_editor",
                 )
+                opportunity_selected_favorites = selected_favorite_rows(opportunities_df, opportunity_favorite_editor)
+                if st.button(
+                    "Favorilere kaydet",
+                    type="secondary",
+                    use_container_width=True,
+                    disabled=opportunity_selected_favorites.empty,
+                    key="radar_opportunities_save_favorites",
+                ):
+                    added_count = add_favorite_rows(opportunity_selected_favorites.to_dict("records"))
+                    total_favorites = len(favorite_rows())
+                    st.success(f"{added_count} ürün favorilere kaydedildi. Favorilerde toplam {total_favorites} ürün var.")
+                    time.sleep(0.2)
+                    st.rerun()
                 st.download_button(
                     "Fırsat listesini CSV indir",
                     data=dataframe_download(opportunities_df),
@@ -4628,12 +5343,26 @@ if selected_main_tab == "Manuel ürün özeti":
         if product_summary_df.empty:
             st.info("Ürün özeti yok.")
         else:
-            st.dataframe(
-                display_product_links(product_summary_df),
-                use_container_width=True,
-                hide_index=True,
-                column_config=product_link_column_config(),
+            manual_summary_favorite_editor = favorite_editor(
+                product_summary_df,
+                "manual_summary_favorite_editor",
             )
+            manual_summary_selected_favorites = selected_favorite_rows(
+                product_summary_df,
+                manual_summary_favorite_editor,
+            )
+            if st.button(
+                "Favorilere kaydet",
+                type="secondary",
+                use_container_width=True,
+                disabled=manual_summary_selected_favorites.empty,
+                key="manual_summary_save_favorites",
+            ):
+                added_count = add_favorite_rows(manual_summary_selected_favorites.to_dict("records"))
+                total_favorites = len(favorite_rows())
+                st.success(f"{added_count} ürün favorilere kaydedildi. Favorilerde toplam {total_favorites} ürün var.")
+                time.sleep(0.2)
+                st.rerun()
             st.download_button(
                 "Ürün özetlerini CSV indir",
                 data=dataframe_download(product_summary_df),
@@ -4711,6 +5440,49 @@ if selected_main_tab == "NKS ve stok":
             st.error(str(exc))
 
     saved_nks_rows = nks_stock_saved_rows()
+    missing_stock_nks_rows = [
+        row for row in saved_nks_rows if safe_int(row.get("Trendyol stoğu")) is None
+    ]
+    refresh_missing_saved = st.button(
+        f"Sadece stoğu boş NKS kayıtlarını güncelle ({len(missing_stock_nks_rows)})",
+        type="secondary",
+        use_container_width=True,
+        disabled=not missing_stock_nks_rows,
+    )
+    if refresh_missing_saved:
+        try:
+            live_container = st.empty()
+            missing_products = [
+                {
+                    "Ürün ID": row.get("Ürün ID"),
+                    "Ürün": row.get("Ürün adı"),
+                    "Link": row.get("Trendyol linki"),
+                    "Marka": row.get("Marka"),
+                    "Kategori": row.get("Kategori"),
+                }
+                for row in missing_stock_nks_rows
+            ]
+            with st.status("Stoğu boş NKS ürünleri güncelleniyor...", expanded=True) as status:
+                rows, errors = nks_stock_rows(
+                    missing_products,
+                    None,
+                    status_container=status,
+                    delay_seconds=0,
+                    live_container=live_container,
+                )
+                status.update(label="Stoğu boş NKS ürünleri güncellendi.", state="complete")
+            st.session_state["nks_stock_result"] = {
+                "rows": rows,
+                "errors": errors,
+                "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "brand": "Stoğu boş kayıtlar",
+                "category": "Stoğu boş kayıtlar",
+            }
+            time.sleep(0.2)
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
     refresh_saved = st.button(
         "Kayıtlı NKS ürünlerini güncelle",
         type="secondary",
@@ -4760,15 +5532,36 @@ if selected_main_tab == "NKS ve stok":
         if result_df.empty:
             st.info("Sonuç bulunamadı.")
         else:
-            display_df = result_df[["Ürün adı", "Trendyol linki", "Trendyol stoğu", "3 günlük satış"]].copy()
+            display_df = result_df[["Ürün ID", "Ürün adı", "Trendyol linki", "Trendyol stoğu", "3 günlük satış"]].copy()
             st.dataframe(
-                display_df,
+                display_df[["Ürün adı", "Trendyol linki", "Trendyol stoğu", "3 günlük satış"]],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
                     "Trendyol linki": st.column_config.LinkColumn("Trendyol linki", display_text="Aç"),
                 },
             )
+            nks_result_favorite_editor = favorite_editor(
+                nks_rows_to_favorites(display_df),
+                "nks_result_favorite_editor",
+            )
+            nks_result_selected_favorites = selected_favorite_rows(
+                display_df,
+                nks_result_favorite_editor,
+                transform_rows=nks_rows_to_favorites,
+            )
+            if st.button(
+                "Favorilere kaydet",
+                type="secondary",
+                use_container_width=True,
+                disabled=nks_result_selected_favorites.empty,
+                key="nks_result_save_favorites",
+            ):
+                added_count = add_favorite_rows(nks_result_selected_favorites.to_dict("records"))
+                total_favorites = len(favorite_rows())
+                st.success(f"{added_count} ürün favorilere kaydedildi. Favorilerde toplam {total_favorites} ürün var.")
+                time.sleep(0.2)
+                st.rerun()
             st.download_button(
                 "NKS ve stok Excel indir",
                 data=excel_download({"NKS ve stok": display_df}),
@@ -4802,17 +5595,39 @@ if selected_main_tab == "NKS ve stok":
         for saved_brand_name in saved_brand_names:
             brand_saved_df = saved_nks_df[saved_nks_df["Marka"] == saved_brand_name].copy()
             saved_display_df = brand_saved_df[
-                ["Ürün adı", "Trendyol linki", "Trendyol stoğu", "3 günlük satış", "Son güncelleme"]
+                ["Ürün ID", "Ürün adı", "Trendyol linki", "Trendyol stoğu", "3 günlük satış", "Son güncelleme"]
             ].copy()
+            safe_brand_key = re.sub(r"[^a-zA-Z0-9_]+", "_", saved_brand_name).strip("_") or "brand"
             with st.expander(f"{saved_brand_name} ({len(saved_display_df)} ürün)", expanded=saved_brand_name == "Karaca"):
                 st.dataframe(
-                    saved_display_df,
+                    saved_display_df[["Ürün adı", "Trendyol linki", "Trendyol stoğu", "3 günlük satış", "Son güncelleme"]],
                     use_container_width=True,
                     hide_index=True,
                     column_config={
                         "Trendyol linki": st.column_config.LinkColumn("Trendyol linki", display_text="Aç"),
                     },
                 )
+                saved_nks_favorite_editor = favorite_editor(
+                    nks_rows_to_favorites(saved_display_df),
+                    f"saved_nks_favorite_editor_{safe_brand_key}",
+                )
+                saved_nks_selected_favorites = selected_favorite_rows(
+                    saved_display_df,
+                    saved_nks_favorite_editor,
+                    transform_rows=nks_rows_to_favorites,
+                )
+                if st.button(
+                    "Favorilere kaydet",
+                    type="secondary",
+                    use_container_width=True,
+                    disabled=saved_nks_selected_favorites.empty,
+                    key=f"saved_nks_save_favorites_{safe_brand_key}",
+                ):
+                    added_count = add_favorite_rows(saved_nks_selected_favorites.to_dict("records"))
+                    total_favorites = len(favorite_rows())
+                    st.success(f"{added_count} ürün favorilere kaydedildi. Favorilerde toplam {total_favorites} ürün var.")
+                    time.sleep(0.2)
+                    st.rerun()
         st.download_button(
             "Kayıtlı NKS ürünlerini Excel indir",
             data=excel_download(
@@ -4841,6 +5656,14 @@ if selected_main_tab == "Marka ve stok":
                 f"Kaydedilmiş tarama geri yüklendi: "
                 f"{restored_result.get('next_index', 0)}/{len(restored_result.get('products', []))} ürün kontrol edilmiş."
             )
+    else:
+        active_result = st.session_state.get("brand_stock_result") or {}
+        if not active_result.get("checked"):
+            restored_result = load_brand_stock_state()
+            if restored_result and restored_result.get("checked"):
+                st.session_state["brand_stock_result"] = restored_result
+                st.session_state["brand_stock_autorun"] = False
+                st.info("Kayıtlı tarama sonucu yeniden yüklendi.")
 
     persisted_result = st.session_state.get("brand_stock_result") or {}
     persisted_brands = [
@@ -4905,6 +5728,11 @@ if selected_main_tab == "Marka ve stok":
         value=200,
         step=50,
         help="Online sitede kapanma yaşamamak için büyük taramaları parça parça çalıştırır.",
+    )
+    brand_use_saved_nks = st.checkbox(
+        "Kayıtlı NKS verilerini sonuçlara ekle",
+        value=True,
+        help="NKS ve stok ekranında kaydedilmiş ürünleri yerel veritabanından anında eşleştirir. Dış sorgu yapmadığı için hızlıdır.",
     )
     brand_add_nks_sales = st.checkbox(
         "Nekadarsatti kategori çok satanlarından 3 günlük satış verisi ekle",
@@ -5065,8 +5893,13 @@ if selected_main_tab == "Marka ve stok":
 
     if "brand_stock_result" in st.session_state:
         result = st.session_state["brand_stock_result"]
-        checked_df = pd.DataFrame(result["checked"])
-        errors_df = pd.DataFrame(result["errors"])
+        checked_df, errors_df = result_dataframes(result, "brand_stock_result")
+        saved_nks_map = saved_nks_sales_map() if brand_use_saved_nks and not checked_df.empty else {}
+        if saved_nks_map:
+            checked_df = pd.DataFrame(apply_category_sales_to_rows(result["checked"], saved_nks_map))
+            saved_match_count = int(checked_df["NKS eşleşme"].astype(str).eq("Kayıtlı").sum()) if "NKS eşleşme" in checked_df.columns else 0
+            if saved_match_count:
+                st.caption(f"Kayıtlı NKS verisinden {saved_match_count} satır eşleşti.")
         if brand_add_nks_sales and not checked_df.empty:
             selected_brand_names = result.get("selected_brands") or [
                 brand.strip()
@@ -5108,9 +5941,10 @@ if selected_main_tab == "Marka ve stok":
                         state="complete",
                     )
             if result.get("nks_sales_map"):
-                checked_df = pd.DataFrame(apply_category_sales_to_rows(result["checked"], result["nks_sales_map"]))
+                combined_nks_map = {**saved_nks_map, **result["nks_sales_map"]}
+                checked_df = pd.DataFrame(apply_category_sales_to_rows(result["checked"], combined_nks_map))
             elif category_map:
-                checked_df = pd.DataFrame(apply_category_sales_to_rows(result["checked"], {}))
+                checked_df = pd.DataFrame(apply_category_sales_to_rows(result["checked"], saved_nks_map))
             nks_errors = result.get("nks_sales_errors") or []
             if nks_errors:
                 error_preview = "; ".join(
@@ -5119,6 +5953,9 @@ if selected_main_tab == "Marka ve stok":
                 )
                 st.warning(f"Nekadarsatti satış verisi alınamadı: {error_preview}")
         product_summary_df = product_summary_rows(checked_df)
+        if product_summary_df.empty and not checked_df.empty:
+            st.warning("Özet tablo oluşturulamadı; satıcı/varyant detaylarından sonuçlar gösteriliyor.")
+            product_summary_df = checked_df.copy()
 
         st.divider()
         metric_cols = st.columns(4)
@@ -5148,22 +5985,21 @@ if selected_main_tab == "Marka ve stok":
             )
 
         if product_summary_df.empty:
-            st.info("Bu marka ve maksimum stok eşiğiyle ürün bulunamadı.")
+            if result.get("complete") and result.get("products") and not result.get("checked"):
+                st.warning(
+                    "Bu tarama tamamlanmış görünüyor ama kayıtlı sonuç satırı yok. "
+                    "Sonucu sıfırla deyip taramayı yeniden başlat."
+                )
+            else:
+                st.info("Bu marka ve maksimum stok eşiğiyle ürün bulunamadı.")
         else:
             default_brand_stock_columns = [
-                "Ürün ID",
                 "Ürün",
-                "Marka",
-                "Kategori",
+                "Trendyol linki",
                 "En yüksek stok satıcısı",
-                "En yüksek stok",
-                "Toplam stok",
-                "3 günlük satış",
-                "3 günlük ciro",
-                "NKS kategori",
+                "Trendyol stoğu",
+                "Toplam Trendyol stoğu",
                 "Satıcı stokları",
-                "Favori",
-                "Yorum",
                 "Değerlendirme",
             ]
             filtered_summary_df = configurable_table(
@@ -5172,25 +6008,20 @@ if selected_main_tab == "Marka ve stok":
                 default_brand_stock_columns,
             )
             favorite_selection_df = favorite_editor(filtered_summary_df, "brand_stock_favorite_editor")
-            selected_favorite_ids = []
-            if "Favoriye ekle" in favorite_selection_df.columns and "Ürün ID" in favorite_selection_df.columns:
-                selected_favorite_ids = (
-                    favorite_selection_df.loc[favorite_selection_df["Favoriye ekle"], "Ürün ID"]
-                    .astype(str)
-                    .tolist()
-                )
+            selected_favorite_rows_df = selected_favorite_rows(
+                filtered_summary_df,
+                favorite_selection_df,
+            )
             if st.button(
-                "Seçili ürünleri favorilere ekle",
+                "Favorilere kaydet",
                 type="secondary",
                 use_container_width=True,
-                disabled=not selected_favorite_ids,
+                disabled=selected_favorite_rows_df.empty,
+                key="brand_stock_save_favorites",
             ):
-                rows_to_favorite = filtered_summary_df[
-                    filtered_summary_df["Ürün ID"].astype(str).isin(selected_favorite_ids)
-                ].to_dict("records")
-                added_count = add_favorite_rows(rows_to_favorite)
+                added_count = add_favorite_rows(selected_favorite_rows_df.to_dict("records"))
                 total_favorites = len(favorite_rows())
-                st.success(f"{added_count} ürün favorilere eklendi. Favorilerde toplam {total_favorites} ürün var.")
+                st.success(f"{added_count} ürün favorilere kaydedildi. Favorilerde toplam {total_favorites} ürün var.")
                 time.sleep(0.2)
                 st.rerun()
             st.download_button(
@@ -5199,99 +6030,102 @@ if selected_main_tab == "Marka ve stok":
                 file_name="trendyol_marka_stok_listesi.csv",
                 mime="text/csv",
             )
-            excel_sheets = {"Özet": filtered_summary_df}
-            if not checked_df.empty:
-                excel_sheets["Satıcı detayları"] = display_product_links(checked_df)
-            if not errors_df.empty:
-                excel_sheets["Hatalar"] = display_product_links(errors_df)
-            if brand_add_nks_sales:
-                nks_sales_df = pd.DataFrame(result.get("nks_sales_rows", []))
-                nks_errors_df = pd.DataFrame(result.get("nks_sales_errors", []))
-                if not nks_sales_df.empty:
-                    excel_sheets["NKS satışları"] = nks_sales_df
-                if not nks_errors_df.empty:
-                    excel_sheets["NKS hataları"] = nks_errors_df
-            st.download_button(
-                "Marka stok listesini Excel indir",
-                data=excel_download(excel_sheets),
-                file_name="trendyol_marka_stok_listesi.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-            st.divider()
-            st.subheader("English Home stok karşılaştırma")
-            st.caption(
-                "English Home ürünlerini burada kalıcı tutar; Trendyol stoku, English Home web stok alanı ve iki link birlikte izlenir."
-            )
-            english_home_summary_df = filtered_summary_df[
-                filtered_summary_df.get("Marka", pd.Series(dtype=object)).astype(str).str.casefold() == "english home"
-            ].copy()
-            english_save_col, english_refresh_col = st.columns([1, 1])
-            with english_save_col:
-                if st.button(
-                    "Bu taramadaki English Home ürünlerini listeye kaydet",
-                    use_container_width=True,
-                    disabled=english_home_summary_df.empty,
-                ):
-                    save_rows = english_home_summary_df.rename(
-                        columns={"Link": "Trendyol link", "Toplam stok": "Trendyol stok"}
-                    ).to_dict("records")
-                    saved_count = upsert_english_home_stock_rows(save_rows)
-                    st.success(f"{saved_count} English Home ürünü kalıcı listeye kaydedildi.")
-                    time.sleep(0.2)
-                    st.rerun()
-
-            saved_english_home_rows = english_home_stock_rows()
-            with english_refresh_col:
-                if st.button(
-                    "Kalıcı English Home listesinin stoklarını güncelle",
-                    type="secondary",
-                    use_container_width=True,
-                    disabled=not saved_english_home_rows,
-                ):
-                    refresh_progress = st.progress(0, text="English Home stokları güncelleniyor")
-                    _, refresh_errors = refresh_english_home_stock_items(saved_english_home_rows, progress=refresh_progress)
-                    if refresh_errors:
-                        st.warning(f"Güncelleme bitti; {len(refresh_errors)} alanda veri alınamadı.")
-                    else:
-                        st.success("English Home stokları güncellendi.")
-                    time.sleep(0.2)
-                    st.rerun()
-
-            saved_english_home_df = pd.DataFrame(english_home_stock_rows())
-            if saved_english_home_df.empty:
-                st.info("Kalıcı English Home listesi boş. Önce English Home marka taraması yapıp çıkan ürünleri listeye kaydet.")
-            else:
-                english_default_columns = [
-                    "Ürün ID",
-                    "Ürün",
-                    "Kategori",
-                    "Trendyol stok",
-                    "Web sitesi stok",
-                    "Barkod",
-                    "Son güncelleme",
-                    "Trendyol link",
-                    "English Home link",
-                ]
-                english_filtered_df = configurable_table(
-                    saved_english_home_df,
-                    "english_home_stock_compare",
-                    english_default_columns,
-                )
-                st.dataframe(
-                    english_filtered_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config=english_home_link_column_config(),
-                )
+            if st.checkbox("Excel dosyasını hazırla", value=False, key="brand_stock_prepare_excel"):
+                excel_sheets = {"Özet": filtered_summary_df}
+                if not checked_df.empty:
+                    excel_sheets["Satıcı detayları"] = display_product_links(checked_df.head(5000))
+                if not errors_df.empty:
+                    excel_sheets["Hatalar"] = display_product_links(errors_df)
+                if brand_add_nks_sales:
+                    nks_sales_df = pd.DataFrame(result.get("nks_sales_rows", []))
+                    nks_errors_df = pd.DataFrame(result.get("nks_sales_errors", []))
+                    if not nks_sales_df.empty:
+                        excel_sheets["NKS satışları"] = nks_sales_df
+                    if not nks_errors_df.empty:
+                        excel_sheets["NKS hataları"] = nks_errors_df
                 st.download_button(
-                    "English Home stok karşılaştırmasını Excel indir",
-                    data=excel_download({"English Home": english_filtered_df}),
-                    file_name="english_home_stok_karsilastirma.xlsx",
+                    "Marka stok listesini Excel indir",
+                    data=excel_download(excel_sheets),
+                    file_name="trendyol_marka_stok_listesi.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-        with st.expander("Satıcı/varyant detayları"):
+            if st.checkbox("English Home stok karşılaştırmasını göster", value=False, key="show_english_home_compare"):
+                st.divider()
+                st.subheader("English Home stok karşılaştırma")
+                st.caption(
+                    "English Home ürünlerini burada kalıcı tutar; Trendyol stoku, English Home web stok alanı ve iki link birlikte izlenir."
+                )
+                english_home_summary_df = filtered_summary_df[
+                    filtered_summary_df.get("Marka", pd.Series(dtype=object)).astype(str).str.casefold() == "english home"
+                ].copy()
+                english_save_col, english_refresh_col = st.columns([1, 1])
+                with english_save_col:
+                    if st.button(
+                        "Bu taramadaki English Home ürünlerini listeye kaydet",
+                        use_container_width=True,
+                        disabled=english_home_summary_df.empty,
+                    ):
+                        save_rows = english_home_summary_df.rename(
+                            columns={"Link": "Trendyol link", "Toplam stok": "Trendyol stok"}
+                        ).to_dict("records")
+                        saved_count = upsert_english_home_stock_rows(save_rows)
+                        st.success(f"{saved_count} English Home ürünü kalıcı listeye kaydedildi.")
+                        time.sleep(0.2)
+                        st.rerun()
+
+                saved_english_home_rows = english_home_stock_rows()
+                with english_refresh_col:
+                    if st.button(
+                        "Kalıcı English Home listesinin stoklarını güncelle",
+                        type="secondary",
+                        use_container_width=True,
+                        disabled=not saved_english_home_rows,
+                    ):
+                        refresh_progress = st.progress(0, text="English Home stokları güncelleniyor")
+                        _, refresh_errors = refresh_english_home_stock_items(saved_english_home_rows, progress=refresh_progress)
+                        if refresh_errors:
+                            st.warning(f"Güncelleme bitti; {len(refresh_errors)} alanda veri alınamadı.")
+                        else:
+                            st.success("English Home stokları güncellendi.")
+                        time.sleep(0.2)
+                        st.rerun()
+
+                saved_english_home_df = pd.DataFrame(english_home_stock_rows())
+                if saved_english_home_df.empty:
+                    st.info("Kalıcı English Home listesi boş. Önce English Home marka taraması yapıp çıkan ürünleri listeye kaydet.")
+                else:
+                    english_default_columns = [
+                        "Ürün ID",
+                        "Ürün",
+                        "Kategori",
+                        "Trendyol stok",
+                        "Web sitesi stok",
+                        "Barkod",
+                        "Son güncelleme",
+                        "Trendyol link",
+                        "English Home link",
+                    ]
+                    english_filtered_df = configurable_table(
+                        saved_english_home_df,
+                        "english_home_stock_compare",
+                        english_default_columns,
+                    )
+                    st.dataframe(
+                        english_filtered_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config=english_home_link_column_config(),
+                    )
+                    if st.checkbox("English Home Excel dosyasını hazırla", value=False, key="english_home_prepare_excel"):
+                        st.download_button(
+                            "English Home stok karşılaştırmasını Excel indir",
+                            data=excel_download({"English Home": english_filtered_df}),
+                            file_name="english_home_stok_karsilastirma.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        )
+
+        if st.checkbox("Satıcı/varyant detaylarını göster", value=False, key="show_brand_stock_details"):
             if checked_df.empty:
                 st.info("Detay satırı yok.")
             else:
@@ -5301,6 +6135,7 @@ if selected_main_tab == "Marka ve stok":
                     [
                         "Ürün ID",
                         "Ürün",
+                        "Trendyol linki",
                         "Marka",
                         "Satıcı",
                         "Varyant",
@@ -5320,7 +6155,7 @@ if selected_main_tab == "Marka ve stok":
                     column_config=product_link_column_config(),
                 )
 
-        with st.expander("Hatalar"):
+        if st.checkbox("Hataları göster", value=False, key="show_brand_stock_errors"):
             if errors_df.empty:
                 st.success("Hata yok.")
             else:
@@ -5562,14 +6397,30 @@ if selected_main_tab == "Favoriler":
             "3 günlük ciro",
             "NKS kategori",
             "Satıcı stokları",
-            "Favoriye eklenme",
+            "Trendyol stok güncellendi",
+            "NKS güncellendi",
         ]
         filtered_favorites_df = configurable_table(
             favorites_df,
             "favorites_table",
             default_favorite_columns,
         )
+        favorite_refresh_rows = source_rows_for_visible_table(favorites_df, filtered_favorites_df)
+        if favorite_refresh_rows:
+            st.markdown("#### Stok ve NKS değişimi")
+            render_favorite_change_table(pd.DataFrame(favorite_refresh_rows))
+
         display_favorites_df = display_product_links(filtered_favorites_df)
+        display_favorites_df = clean_integer_float_columns(
+            display_favorites_df,
+            [
+                "3 günlük satış",
+                "3 günlük ciro",
+                "NKS favori",
+                "NKS satış önceki",
+                "NKS satış değişim",
+            ],
+        )
         if "Sil" in display_favorites_df.columns:
             display_favorites_df = display_favorites_df.drop(columns=["Sil"])
         display_favorites_df.insert(0, "Sil", False)
@@ -5591,6 +6442,69 @@ if selected_main_tab == "Favoriler":
                 .astype(str)
                 .tolist()
             )
+
+        missing_nks_favorite_rows = favorite_rows_without_nks(favorite_refresh_rows)
+        refresh_stock_col, refresh_nks_col, refresh_missing_nks_col = st.columns([1, 1, 1])
+        with refresh_stock_col:
+            if st.button(
+                "Trendyol stokları güncelle",
+                type="secondary",
+                use_container_width=True,
+                disabled=not favorite_refresh_rows,
+            ):
+                progress = st.progress(0, text="Favori Trendyol stokları güncelleniyor")
+                updated_rows, update_errors = refresh_favorite_trendyol_stocks(
+                    favorite_refresh_rows,
+                    progress=progress,
+                )
+                if update_errors:
+                    st.warning(f"Trendyol stok güncellemesi bitti; {len(update_errors)} üründe hata var.")
+                else:
+                    st.success(f"{len(updated_rows)} favorinin Trendyol stoğu güncellendi.")
+                time.sleep(0.2)
+                st.rerun()
+        with refresh_nks_col:
+            if st.button(
+                "NKS'yi güncelle",
+                type="secondary",
+                use_container_width=True,
+                disabled=not favorite_refresh_rows,
+            ):
+                progress = st.progress(0, text="Favori NKS satışları güncelleniyor")
+                updated_rows, update_errors, quota_stopped = refresh_favorite_nks_sales(
+                    favorite_refresh_rows,
+                    progress=progress,
+                )
+                if quota_stopped:
+                    first_error = update_errors[-1].get("Hata") if update_errors else "NKS kotası doldu."
+                    st.warning(f"NKS kotası nedeniyle durdu. Güncellenen: {len(updated_rows)}. Mesaj: {first_error}")
+                elif update_errors:
+                    st.warning(f"NKS güncellemesi bitti; {len(update_errors)} üründe hata var.")
+                else:
+                    st.success(f"{len(updated_rows)} favorinin NKS satış verisi güncellendi.")
+                time.sleep(0.2)
+                st.rerun()
+        with refresh_missing_nks_col:
+            if st.button(
+                f"NKS'si olmayanları güncelle ({len(missing_nks_favorite_rows)})",
+                type="secondary",
+                use_container_width=True,
+                disabled=not missing_nks_favorite_rows,
+            ):
+                progress = st.progress(0, text="NKS'si olmayan favoriler güncelleniyor")
+                updated_rows, update_errors, quota_stopped = refresh_favorite_nks_sales(
+                    missing_nks_favorite_rows,
+                    progress=progress,
+                )
+                if quota_stopped:
+                    first_error = update_errors[-1].get("Hata") if update_errors else "NKS kotası doldu."
+                    st.warning(f"NKS kotası nedeniyle durdu. Güncellenen: {len(updated_rows)}. Mesaj: {first_error}")
+                elif update_errors:
+                    st.warning(f"NKS güncellemesi bitti; {len(update_errors)} üründe hata var.")
+                else:
+                    st.success(f"{len(updated_rows)} favorinin NKS satış verisi güncellendi.")
+                time.sleep(0.2)
+                st.rerun()
 
         delete_col, download_col = st.columns([1, 1])
         with delete_col:
