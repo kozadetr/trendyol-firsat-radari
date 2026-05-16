@@ -394,7 +394,7 @@ BRAND_STOCK_BRANDS = {
     "ACAR": "https://www.trendyol.com/acar-x-b110584",
 }
 BRAND_STOCK_PRODUCTS_PER_PAGE = 24
-BRAND_STOCK_WORKERS = 12
+BRAND_STOCK_WORKERS = 4
 BRAND_STOCK_LIVE_RENDER_EVERY = 12
 BRAND_STOCK_PROGRESS_EVERY = 10
 LOGO_PATH = Path(__file__).parent / "assets" / "kozade.png"
@@ -784,7 +784,7 @@ def apply_kozade_theme():
 apply_kozade_theme()
 
 
-def request_page(url):
+def request_page(url, retry_on_rate_limit=True):
     request = Request(
         url,
         headers={
@@ -799,6 +799,16 @@ def request_page(url):
             charset = response.headers.get_content_charset() or "utf-8"
             return response.read().decode(charset, errors="replace")
     except HTTPError as exc:
+        if exc.code == 429 and retry_on_rate_limit:
+            retry_after = safe_positive_int(exc.headers.get("Retry-After"), 180)
+            wait_seconds = min(retry_after, 300)
+            time.sleep(wait_seconds)
+            return request_page(url, retry_on_rate_limit=False)
+        if exc.code == 429:
+            retry_after = safe_positive_int(exc.headers.get("Retry-After"), 180)
+            raise RuntimeError(
+                f"Trendyol geçici istek limiti verdi. Yaklaşık {retry_after} saniye sonra tekrar dene."
+            ) from exc
         raise RuntimeError(f"Sayfa açılamadı. HTTP {exc.code}: {url}") from exc
     except URLError as exc:
         raise RuntimeError(f"Bağlantı kurulamadı: {exc.reason}") from exc
@@ -4142,6 +4152,46 @@ def delete_favorites(product_ids):
         return deleted_count
 
 
+def selected_delete_favorite_ids(source_df, editor_df):
+    if source_df.empty or editor_df.empty or "Sil" not in editor_df.columns:
+        return []
+
+    selected_rows = editor_df[editor_df["Sil"]].copy()
+    if selected_rows.empty:
+        return []
+
+    selected_ids = set()
+    if "Ürün ID" in selected_rows.columns:
+        selected_ids.update(
+            str(product_id).strip()
+            for product_id in selected_rows["Ürün ID"].tolist()
+            if str(product_id).strip()
+        )
+
+    for column in ["Link", "Trendyol linki", "Ürün linki", "Trendyol link"]:
+        if column in selected_rows.columns:
+            selected_ids.update(
+                product_id
+                for product_id in selected_rows[column].map(extract_product_id).tolist()
+                if product_id
+            )
+
+    if selected_ids:
+        return sorted(selected_ids)
+
+    matching_indexes = source_df.index.intersection(selected_rows.index)
+    if len(matching_indexes) and "Ürün ID" in source_df.columns:
+        return (
+            source_df.loc[matching_indexes, "Ürün ID"]
+            .astype(str)
+            .str.strip()
+            .loc[lambda values: values.ne("")]
+            .tolist()
+        )
+
+    return []
+
+
 def excel_download(sheets):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -6377,6 +6427,7 @@ if selected_main_tab == "Favoriler":
         default_favorite_columns = [
             "Ürün ID",
             "Ürün",
+            "Trendyol linki",
             "Marka",
             "Kategori",
             "En yüksek stok satıcısı",
@@ -6399,7 +6450,17 @@ if selected_main_tab == "Favoriler":
             st.markdown("#### Stok ve NKS değişimi")
             render_favorite_change_table(pd.DataFrame(favorite_refresh_rows))
 
-        display_favorites_df = display_product_links(filtered_favorites_df)
+        favorites_table_df = filtered_favorites_df.copy()
+        if "Link" not in favorites_table_df.columns:
+            source_link_rows = source_rows_for_visible_table(favorites_df, favorites_table_df)
+            source_link_map = {
+                str(row.get("Ürün ID") or "").strip(): row.get("Link")
+                for row in source_link_rows
+                if str(row.get("Ürün ID") or "").strip() and row.get("Link")
+            }
+            if source_link_map and "Ürün ID" in favorites_table_df.columns:
+                favorites_table_df["Link"] = favorites_table_df["Ürün ID"].astype(str).map(source_link_map)
+        display_favorites_df = display_product_links(favorites_table_df)
         display_favorites_df = clean_integer_float_columns(
             display_favorites_df,
             [
@@ -6425,12 +6486,13 @@ if selected_main_tab == "Favoriler":
             key="favorites_delete_editor",
         )
         selected_delete_ids = []
-        if "Sil" in favorite_delete_df.columns and "Ürün ID" in favorite_delete_df.columns:
-            selected_delete_ids = (
-                favorite_delete_df.loc[favorite_delete_df["Sil"], "Ürün ID"]
-                .astype(str)
-                .tolist()
+        if "Sil" in favorite_delete_df.columns:
+            selected_delete_ids = selected_delete_favorite_ids(
+                filtered_favorites_df,
+                favorite_delete_df,
             )
+        if selected_delete_ids:
+            st.caption(f"{len(selected_delete_ids)} favori silinmek üzere seçildi.")
 
         missing_nks_favorite_rows = favorite_rows_without_nks(favorite_refresh_rows)
         refresh_stock_col, refresh_nks_col, refresh_missing_nks_col = st.columns([1, 1, 1])
@@ -6505,6 +6567,7 @@ if selected_main_tab == "Favoriler":
             ):
                 deleted_count = delete_favorites(selected_delete_ids)
                 st.success(f"{deleted_count} favori silindi.")
+                time.sleep(0.2)
                 st.rerun()
         with download_col:
             st.download_button(
